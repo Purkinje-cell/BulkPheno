@@ -3,8 +3,8 @@ import torch.nn.functional as F
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import Adam
-from BulkPheno.src.model import VAE, MLP
-from BulkPheno.src.dataset import TCGADataset
+from src.model import VAE, MLP
+from src.dataset import TCGADataset
 
 # 超参数
 input_dim = 398
