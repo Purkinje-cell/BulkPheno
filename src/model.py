@@ -106,8 +106,10 @@ class Encoder(nn.Module):
         super(Encoder, self).__init__()
         
         self.encoder = FCLayers(
-            n_input, 2 * n_latent, n_cat_list, n_layers, n_hidden, dropout_rate
+            n_input, n_hidden, n_cat_list, n_layers, n_hidden, dropout_rate
         )
+        self.mean_encoder = nn.Linear(n_hidden, n_latent)
+        self.var_encoder = nn.Linear(n_hidden, n_latent)
     
     def reparameterize(self, mu, var):
         std = torch.sqrt(var)
@@ -115,8 +117,9 @@ class Encoder(nn.Module):
         return mu + eps * std
     
     def forward(self, x, *cat_list):
-        mu, log_var = self.encoder(x, *cat_list).chunk(2, dim=1)
-        var = torch.exp(log_var) + 1e-4
+        q = self.encoder(x, *cat_list)
+        mu = self.mean_encoder(q)
+        var = torch.exp(self.var_encoder(q)) + 1e-4
         z = self.reparameterize(mu, var)
         return z, mu, var
     
@@ -147,13 +150,10 @@ class Decoder(nn.Module):
         self.dispersion_decoder = nn.Linear(n_hidden, n_output)
         
     def forward(self, z: torch.Tensor, library_size: torch.Tensor, *cat_list: torch.Tensor):
-        print(z.shape)
-        print(library_size.shape)
         hidden = self.decoder(z, *cat_list)
         gamma = self.gamma_decoder(hidden)
-        print(gamma.shape)
         rate = torch.exp(library_size) * gamma
-        dispersion = self.dispersion_decoder(hidden)
+        dispersion = None
         return gamma, dispersion, rate
 
 class Classifier(nn.Module):
@@ -238,6 +238,12 @@ class BulkVAE(nn.Module):
             -NegativeBinomial(mu=rate, theta=dispersion).log_prob(x).sum(dim=-1)
         )
         return reconst_loss
+    
+    def generate(self, z, batch_index=None, y=None):
+        gamma, dispersion, rate = self.decoder(z, batch_index, y)
+        dispersion = torch.exp(dispersion)
+        px_r = NegativeBinomial(mu=rate, theta=dispersion).sample()
+        return px_r
 
     def inference(self, x, batch_index=None, y=None, n_samples=1):
         x_ = x
@@ -292,6 +298,7 @@ class BulkVAE(nn.Module):
         ys, xs, library_s, batch_index_s = broadcast_labels(
             y, x, l, batch_index, n_broadcast=self.n_labels
         )
+        print(ys)
         outputs = self.inference(xs, batch_index_s, ys)
         dispersion = outputs["dispersion"]
         rate = outputs["rate"]

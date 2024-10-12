@@ -12,8 +12,7 @@ class TCGADataset(Dataset):
         self.label = pd.read_csv(label_path, index_col=0)
         self.target_label = self.label[label_type].astype('category')
         self.n_cat = len(self.target_label.cat.categories)
-        self.target_label = self.target_label.cat.codes.values
-        self.target_label = one_hot(torch.tensor(self.target_label).view(-1, 1), self.n_cat)
+        self.target_label = torch.tensor(self.target_label.cat.codes.values, dtype=torch.float32)
         self.data = torch.tensor(self.expression_mtx.values, dtype=torch.float32) # (n_sample, n_gene)
         
         
@@ -29,12 +28,12 @@ class TCGADataset(Dataset):
 def collate_fn(batch):
     data_batch, target_batch, batch_index = zip(*batch)
 
-    batch_index = torch.tensor(batch_index, dtype=torch.float32)
+    batch_index = torch.tensor(batch_index, dtype=torch.float32).view(-1, 1)
     data_batch = torch.stack(data_batch, dim=0)
     target_batch = torch.stack(target_batch, dim=0)
-    library_sizes = torch.sum(data_batch, dim=1)
+    library_sizes = torch.log1p(torch.mean(data_batch, dim=1))
 
-    mean = torch.mean(library_sizes)
-    variance = torch.var(library_sizes)
+    mean = torch.mean(library_sizes).expand(data_batch.size(0))
+    variance = torch.var(library_sizes).expand(data_batch.size(0))
 
     return data_batch, target_batch, batch_index, mean, variance
