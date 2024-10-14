@@ -29,6 +29,8 @@ def broadcast_labels(y, *o, n_broadcast=-1):
             else x.repeat(n_broadcast),
         )
     else:
+        if y.dim() == 1:
+            y = y.view(-1, 1)
         ys = one_hot(y, n_broadcast)
         new_o = o
     return (ys,) + new_o

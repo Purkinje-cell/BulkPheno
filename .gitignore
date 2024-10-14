@@ -1,5 +1,7 @@
 data/*
+model.pth
 __pycache__/*
+.vscode/*
 lightning_logs/*
 src/lightning_logs/*
 *.pyc

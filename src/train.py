@@ -9,16 +9,16 @@ from trainer import VAETrainer
 import lightning as pl
 
 
-train_dataset = TCGADataset('data/Cleaned_data/Liver/train_exp.csv', 'data/Cleaned_data/Liver/train_label.csv', 'median_surv')
-test_dateset = TCGADataset('data/Cleaned_data/Liver/test_exp.csv', 'data/Cleaned_data/Liver/test_label.csv', 'median_surv')
+train_dataset = TCGADataset('data/Cleaned_data/Liver/train_exp.csv', 'data/Cleaned_data/Liver/train_label.csv', 'sample_type')
+test_dateset = TCGADataset('data/Cleaned_data/Liver/test_exp.csv', 'data/Cleaned_data/Liver/test_label.csv', 'sample_type')
 
 n_input = 398
-n_hidden = 128
-n_latent = 32
+n_hidden = 192
+n_latent = 64
 n_labels = 2
-n_batch = len(train_dataset)
-batch_size = 32
-n_epoch = 100
+n_batch = train_dataset.n_batch
+batch_size = 64
+n_epoch = 200
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 test_loader = DataLoader(test_dateset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
@@ -30,34 +30,41 @@ model = BulkVAE(
     n_hidden=n_hidden,
     n_latent=n_latent,
     n_labels=n_labels,
-    n_layers=2,
-    dropout_rate=0.1,
+    n_layers=3,
+    dropout_rate=0.2,
 )
 
-optimizer = Adam(model.parameters(), lr=1e-2)
+optimizer = Adam(model.parameters(), lr=1e-3)
 for i in range(n_epoch):
     for batch in train_loader:
         optimizer.zero_grad()
         data_batch, target_batch, batch_index, mean, variance = batch
         recon_loss, kl_z, kl_l, classification_loss, probs = model(data_batch, mean, variance, batch_index, target_batch)
-        if i < 20:
-            kl_weight = 0
-        else:
-            kl_weight = 1
-        total_loss = torch.mean(recon_loss + (kl_z + kl_l) * kl_weight) + classification_loss * 1000
+        mean_recon_loss = torch.mean(recon_loss)
+        mean_kl_z = torch.mean(kl_z)
+        mean_kl_l = torch.mean(kl_l)
+        total_loss = mean_recon_loss + mean_kl_z + mean_kl_l + classification_loss * 10
         total_loss.backward()
         optimizer.step()
-        print(total_loss)
+    print(f"Epoch: {i}, Loss: {total_loss}, Recon_loss: {mean_recon_loss}, KL_z: {mean_kl_z}, KL_l: {mean_kl_l}, Classification_loss: {classification_loss}, probs: {probs}")
+    prediction = torch.argmax(probs, dim=1)
+    print(prediction == target_batch)
+    print(torch.sum(prediction == target_batch)/len(target_batch))
 # VAE = VAETrainer(model)
 # trainer = pl.Trainer(max_epochs=n_epoch)
 # trainer.fit(VAE, train_loader, test_loader)
 # trainer.test(VAE, test_loader)
+torch.save(model, 'model.pth')
+# total_latent = []
+# for batch in train_loader:
+#     data_batch, target_batch, batch_index, mean, variance = batch
+#     latent = model.encode(data_batch, mean, variance, batch_index)
+#     total_latent.append(latent)
 
 for batch in test_loader:
     data_batch, target_batch, batch_index, mean, variance = batch
     recon_loss, kl_z, kl_l, probs = model(data_batch, mean, variance, batch_index)
-    print(probs)
     prediction = torch.argmax(probs, dim=1)
-    # print(prediction == target_batch)
-    print(prediction)
+    print(prediction == target_batch)
+    print(torch.sum(prediction == target_batch)/len(target_batch))
 #accuracy = torch.sum(prediction == test_dateset.label['median_surv'].astype('category').cat.codes.values) / len(test_dateset.target_label)

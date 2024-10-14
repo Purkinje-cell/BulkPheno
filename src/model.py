@@ -170,8 +170,7 @@ class Classifier(nn.Module):
             FCLayers(
                 n_input, n_hidden, None, n_layers, n_hidden, dropout_rate=dropout_rate
             ),
-            nn.Linear(n_hidden, n_labels),
-            nn.Softmax(dim=-1)
+            nn.Linear(n_hidden, n_labels)
         )
 
     def forward(self, x):
@@ -210,8 +209,8 @@ class BulkVAE(nn.Module):
         self.log_norm = log_norm
         self.dispersion = nn.Parameter(torch.randn(n_input))
 
-        self.z_encoder = Encoder(n_input, n_hidden, n_latent, n_layers, [n_labels], dropout_rate)
-        self.decoder = Decoder(n_latent, n_hidden, n_input, n_layers, [n_batch, n_labels], dropout_rate)
+        self.z_encoder = Encoder(n_input, n_hidden, n_latent, n_layers, None, dropout_rate)
+        self.decoder = Decoder(n_latent, n_hidden, n_input, n_layers, [n_batch], dropout_rate)
         self.classifier = Classifier(n_latent, n_hidden, n_labels, n_layers, dropout_rate)
         self.l_encoder = Encoder(
             n_input=n_input,
@@ -224,14 +223,14 @@ class BulkVAE(nn.Module):
     def sample_z(self, x, y=None):
         if self.log_norm:
             x = torch.log1p(x)
-        z, mu, log_var = self.z_encoder(x, y)
+        z, mu, log_var = self.z_encoder(x)
         return z
         
-    def sample_l(self, x, y=None):
+    def get_latents(self, x, y=None):
         if self.log_norm:
             x = torch.log1p(x)
-        l, mu, log_var = self.l_encoder(x, y)
-        return l
+        z, mu_z, log_var_z = self.z_encoder(x)
+        return z
         
     def recon_loss(self, x, dispersion, rate):
         reconst_loss = (
@@ -239,18 +238,13 @@ class BulkVAE(nn.Module):
         )
         return reconst_loss
     
-    def generate(self, z, batch_index=None, y=None):
-        gamma, dispersion, rate = self.decoder(z, batch_index, y)
-        dispersion = torch.exp(dispersion)
-        px_r = NegativeBinomial(mu=rate, theta=dispersion).sample()
-        return px_r
 
     def inference(self, x, batch_index=None, y=None, n_samples=1):
         x_ = x
         if self.log_norm:
             x_ = torch.log1p(x)
         
-        z, qz_m, qz_v = self.z_encoder(x_, y)
+        z, qz_m, qz_v = self.z_encoder(x_)
         l, ql_m, ql_v = self.l_encoder(x_)
         if n_samples > 1:
             qz_m = qz_m.unsqueeze(0).expand((n_samples, qz_m.shape[0], qz_m.shape[1]))
@@ -260,7 +254,7 @@ class BulkVAE(nn.Module):
             ql_v = ql_v.unsqueeze(0).expand((n_samples, ql_v.shape[0], ql_v.shape[1]))
             l = Normal(ql_m, ql_v.sqrt()).sample()
         
-        gamma, dispersion, rate = self.decoder(z, l, batch_index, y)
+        gamma, dispersion, rate = self.decoder(z, l, batch_index)
 
         dispersion = self.dispersion
         dispersion = torch.exp(dispersion)
@@ -287,22 +281,10 @@ class BulkVAE(nn.Module):
             y: torch.Tensor, shape (batch_size, n_labels), this is the label for each sample
         '''
         is_labelled = y is not None
-
-        x_ = x
-        if self.log_norm:
-            x_ = torch.log1p(x)
-
-        
-        l, ql_m, ql_v = self.l_encoder(x_)
-        
-        ys, xs, library_s, batch_index_s = broadcast_labels(
-            y, x, l, batch_index, n_broadcast=self.n_labels
-        )
-        print(ys)
-        outputs = self.inference(xs, batch_index_s, ys)
+        outputs = self.inference(x, batch_index)
         dispersion = outputs["dispersion"]
         rate = outputs["rate"]
-        recon_loss = self.recon_loss(xs, dispersion, rate)
+        recon_loss = self.recon_loss(x, dispersion, rate)
         z = outputs["z"]
 
         # KL Divergence for z and l
@@ -316,15 +298,29 @@ class BulkVAE(nn.Module):
         ql_v = outputs["ql_v"]
         kl_l = kl_divergence(Normal(ql_m, ql_v.sqrt()), Normal(local_l_mean, local_l_var)).sum(dim=1)
 
-
-        probs = self.classifier(z)
+        logits = self.classifier(z)
+        probs = F.softmax(logits, dim=-1)
         if not is_labelled:
             return recon_loss, kl_z, kl_l, probs
 
-        classification_loss = F.cross_entropy(probs, y)
+        classification_loss = F.cross_entropy(logits, y, reduction="sum")
 
         return recon_loss, kl_z, kl_l, classification_loss, probs
         
         
-    
-    
+class CrossAttention(nn.Module):
+    def __init__(self, n_input, n_output, n_hidden):
+        super(CrossAttention, self).__init__()
+        self.fc_q = nn.Linear(n_input, n_hidden)
+        self.fc_k = nn.Linear(n_input, n_hidden)
+        self.fc_v = nn.Linear(n_input, n_hidden)
+        self.fc_o = nn.Linear(n_hidden, n_output)
+        
+    def forward(self, x, y):
+        q = self.fc_q(x)
+        k = self.fc_k(y)
+        v = self.fc_v(y)
+        attention = F.softmax(torch.bmm(q, k.transpose(1, 2))/torch.sqrt(torch.tensor(k.size(-1)).float()), dim=-1)
+        out = torch.bmm(attention, v)
+        out = self.fc_o(out)
+        return out

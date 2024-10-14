@@ -12,8 +12,10 @@ class TCGADataset(Dataset):
         self.label = pd.read_csv(label_path, index_col=0)
         self.target_label = self.label[label_type].astype('category')
         self.n_cat = len(self.target_label.cat.categories)
-        self.target_label = torch.tensor(self.target_label.cat.codes.values, dtype=torch.float32)
+        self.target_label = torch.tensor(self.target_label.cat.codes.values, dtype=torch.long)
         self.data = torch.tensor(self.expression_mtx.values, dtype=torch.float32) # (n_sample, n_gene)
+        self.batch_index = torch.tensor(self.label['batch_number'].astype('category').cat.codes.values, dtype=torch.long)
+        self.n_batch = len(self.label['batch_number'].unique())
         
         
     def __len__(self):
@@ -22,7 +24,8 @@ class TCGADataset(Dataset):
     def __getitem__(self, idx):
         x = self.data[idx]
         y = self.target_label[idx]
-        return x, y, idx
+        batch_index = self.batch_index[idx]
+        return x, y, batch_index
 
 
 def collate_fn(batch):
