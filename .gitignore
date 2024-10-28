@@ -4,4 +4,8 @@ __pycache__/*
 .vscode/*
 lightning_logs/*
 src/lightning_logs/*
+mutag/*
+MUTAG/*
+processed/*
+raw/*
 *.pyc

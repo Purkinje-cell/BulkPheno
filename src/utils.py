@@ -1,5 +1,6 @@
 import torch
 
+
 def iterate(obj, func):
     t = type(obj)
     if t is list or t is tuple:
@@ -7,10 +8,12 @@ def iterate(obj, func):
     else:
         return func(obj) if obj is not None else None
 
+
 def one_hot(index, n_cat):
     one_hot = torch.zeros(index.size(0), n_cat, device=index.device)
     one_hot.scatter_(1, index.type(torch.long), 1)
     return one_hot.type(torch.float32)
+
 
 def broadcast_labels(y, *o, n_broadcast=-1):
     """
@@ -24,9 +27,11 @@ def broadcast_labels(y, *o, n_broadcast=-1):
         ys = enumerate_discrete(o[0], n_broadcast)
         new_o = iterate(
             o,
-            lambda x: x.repeat(n_broadcast, 1)
-            if len(x.size()) == 2
-            else x.repeat(n_broadcast),
+            lambda x: (
+                x.repeat(n_broadcast, 1)
+                if len(x.size()) == 2
+                else x.repeat(n_broadcast)
+            ),
         )
     else:
         if y.dim() == 1:
@@ -34,6 +39,7 @@ def broadcast_labels(y, *o, n_broadcast=-1):
         ys = one_hot(y, n_broadcast)
         new_o = o
     return (ys,) + new_o
+
 
 def enumerate_discrete(x, y_dim):
     def batch(batch_size, label):

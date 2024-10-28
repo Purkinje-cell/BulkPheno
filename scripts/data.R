@@ -15,7 +15,7 @@ expdat <- GDCprepare(
     query = query.exp.hg38,
 )
 
-data <- read_table("BulkPheno/TCGA/TCGA-LIHC.htseq_counts.tsv")
+data <- read_table("data/TCGA/TCGA-LIHC.star_tpm.tsv")
 
 exp2 <- function(x){
     x <- as.numeric(x)
@@ -32,17 +32,17 @@ data <- data %>% left_join(gene_symbol, by = c("Ensembl_ID" = "ENSEMBL"))
 
 data <- data %>% dplyr::select(-Ensembl_ID) %>% group_by(SYMBOL) %>% summarise(across(everything(), sum))
 data <- data %>% filter(!is.na(SYMBOL))
-write_tsv(data, "BulkPheno/TCGA/TCGA-LIHC.htseq_counts_clean.tsv")
+write_tsv(data, "data/TCGA/TCGA-LIHC_TPM_clean.tsv")
 
 clinical_data <- read_delim("BulkPheno/TCGA/TCGA-LIHC.GDC_phenotype.tsv", delim="\t")
 colnames(clinical_data)
 
-exp_data <- read.table("BulkPheno/TCGA/TCGA-LIHC.htseq_counts_clean.tsv", header=TRUE, row.names=1)
+exp_data <- read.table("data/TCGA/TCGA-COAD.htseq_counts_clean.tsv", header=TRUE, row.names=1)
 pseudo_bulk_data <- read.csv("BulkPheno/Liver/pseudo_bulk.csv", header=TRUE, row.names=1)
 
 common <- intersect(rownames(exp_data), rownames(pseudo_bulk_data))
 
-survival_data <- read.table("BulkPheno/TCGA/TCGA-LIHC.survival.tsv", header=TRUE, row.names=1)
+survival_data <- read.table("data/TCGA/TCGA-COAD.survival.tsv", header=TRUE, row.names=1)
 rownames(survival_data) <- gsub("-", ".", rownames(survival_data))
 common_sample <- intersect(rownames(survival_data), colnames(exp_data))
 survival_data <- survival_data[common_sample,]
@@ -66,8 +66,9 @@ write.csv(normalized_pseudo_bulk_expression, "BulkPheno/Cleaned_data/Liver/pseud
 
 head(survival_data)
 library(survival)
+library(survminer)
 survfit <- survfit(Surv(OS.time, OS) ~ 1, data = survival_data)
-
+ggsurvplot(survfit, data=survival_data)
 # 计算中位生存期
 median_survival <- summary(survfit)$table['median']
 pattern <- "(?<=\\.)[A-Za-z0-9]+$"
@@ -75,7 +76,7 @@ pattern <- "(?<=\\.)[A-Za-z0-9]+$"
 survival_data$barcode <- rownames(survival_data)
 survival_data <- survival_data %>% filter(!is.na(OS.time)) %>% mutate(median_surv = ifelse(OS.time <= median_survival, "short", "long"), sample_type_code = str_extract(str_extract(barcode, pattern), "[0-9]+"), sample_type = case_when(sample_type_code == '01' ~ 'Tumor', sample_type_code == '02' ~ 'Tumor', sample_type_code == '11'~'Normal')) %>% dplyr::select(-sample_type_code)
 
-write_csv(survival_data, "BulkPheno/Cleaned_data/Liver/TCGA-LIHC.survival_clean.csv")
+write_csv(survival_data, "data/Cleaned_data/Colon/TCGA-COAD.survival_clean.csv")
 
 tumor_barcode <- survival_data %>% filter(sample_type == "Tumor") %>% pull(barcode)
 normal_barcode <- survival_data %>% filter(sample_type == "Normal") %>% pull(barcode)

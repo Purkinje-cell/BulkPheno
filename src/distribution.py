@@ -1,8 +1,10 @@
+import warnings
+
 import torch
 import torch.nn as nn
-import warnings
-from torch.distributions import constraints, Distribution, Gamma, Poisson
+from torch.distributions import Distribution, Gamma, Poisson, constraints
 from torch.distributions.utils import broadcast_all
+
 
 def log_nb_positive(x, mu, theta, eps=1e-8):
     """
@@ -24,9 +26,11 @@ def log_nb_positive(x, mu, theta, eps=1e-8):
     i1 = theta * (torch.log(theta + eps) - log_theta_mu_eps)
     i2 = x * (torch.log(mu + eps) - log_theta_mu_eps)
     i3 = torch.lgamma(x + theta) - torch.lgamma(theta) - torch.lgamma(x + 1)
-    
+
     res = i1 + i2 + i3
     return res
+
+
 class NegativeBinomial(Distribution):
     r"""Negative Binomial(NB) distribution using two parameterizations:
 
@@ -39,6 +43,7 @@ class NegativeBinomial(Distribution):
     `_convert_mean_disp_to_counts_logits` and `_convert_counts_logits_to_mean_disp` provide ways to convert
     one parameterization to another.
     """
+
     arg_constraints = {
         "mu": constraints.greater_than_eq(0),
         "theta": constraints.greater_than(0),
