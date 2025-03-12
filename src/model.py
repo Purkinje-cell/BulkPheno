@@ -1,5 +1,5 @@
 import collections
-from typing import Callable, Iterable, Literal
+from typing import Callable, Iterable, Literal, Union
 
 
 import anndata as ad
@@ -12,6 +12,12 @@ import squidpy as sq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
+try:
+    import faiss
+except ImportError:
+    faiss = None
 from torch.utils.data import DataLoader, Dataset
 from anndata import AnnData
 from networkx import subgraph
@@ -60,6 +66,67 @@ from torch_scatter import scatter_add
 from dataset import ContrastiveBulkDataset
 
 
+class EmbeddingStore:
+    """Stores and indexes latent embeddings for similarity queries"""
+    def __init__(self, metric: str = 'cosine'):
+        self.metric = metric
+        self.embeddings = None
+        self.index = None
+        self.labels = None
+        self.sample_ids = None
+        
+    def build_index(self, embeddings: np.ndarray, labels: np.ndarray, sample_ids: np.ndarray):
+        """Build similarity search index"""
+        self.embeddings = embeddings
+        self.labels = labels
+        self.sample_ids = sample_ids
+        
+        if faiss is not None:
+            # FAISS implementation for production use
+            dim = embeddings.shape[1]
+            if self.metric == 'cosine':
+                self.index = faiss.IndexFlatIP(dim)
+                faiss.normalize_L2(embeddings)
+            else:  # L2
+                self.index = faiss.IndexFlatL2(dim)
+            self.index.add(embeddings)
+        else:
+            # Fallback to sklearn implementation
+            n_neighbors = min(100, len(embeddings)-1)
+            self.index = NearestNeighbors(
+                n_neighbors=n_neighbors,
+                metric=self.metric
+            ).fit(embeddings)
+
+    def query(
+        self, 
+        query_embedding: np.ndarray, 
+        k: int = 5,
+        label_filter: str = None
+    ) -> dict:
+        """Find similar samples in the embedding space"""
+        if self.index is None:
+            raise ValueError("Index not built. Call build_index() first")
+            
+        # Convert to numpy if needed
+        if isinstance(query_embedding, torch.Tensor):
+            query_embedding = query_embedding.cpu().numpy()
+            
+        if faiss is not None:
+            if self.metric == 'cosine':
+                faiss.normalize_L2(query_embedding)
+            distances, indices = self.index.search(query_embedding, k)
+        else:
+            distances, indices = self.index.kneighbors(query_embedding, n_neighbors=k)
+            
+        return {
+            'indices': indices,
+            'distances': distances,
+            'sample_ids': self.sample_ids[indices],
+            'labels': self.labels[indices]
+        }
+
+
 class TripletLoss(nn.Module):
     """Online hard triplet mining with PyTorch's TripletMarginLoss"""
 
@@ -75,9 +142,19 @@ class TripletLoss(nn.Module):
         if triplets is None or len(triplets) == 0:
             return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
         return self.loss_fn(*triplets)
+        
+    def cosine_similarity(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return F.cosine_similarity(a, b, dim=-1)
+    
+    def euclidean_distance(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return F.pairwise_distance(a, b, p=2)
 
     def _get_triplets(self, embeddings, labels):
-        pairwise_dist = torch.cdist(embeddings, embeddings)
+        # Update distance calculation to use cosine similarity
+        pairwise_dist = 1 - self.cosine_similarity(
+            embeddings.unsqueeze(1),
+            embeddings.unsqueeze(0)
+        )
 
         labels = labels.view(-1, 1)
         mask_same = labels == labels.t()
@@ -216,6 +293,7 @@ class ContrastiveAE(pl.LightningModule):
         recon_weight: float = 1.0,
         lr: float = 1e-3,
         dropout: float = 0.2,
+        label_key: str = "cell_type",
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -236,6 +314,9 @@ class ContrastiveAE(pl.LightningModule):
 
         self.triplet_loss = TripletLoss(margin=margin)
         self.recon_loss = nn.MSELoss()
+        
+        # Add embedding store to the model
+        self.embedding_store = EmbeddingStore(metric='cosine')
 
     def forward(self, x):
         return self.decoder(self.encoder(x))
@@ -294,12 +375,55 @@ class ContrastiveAE(pl.LightningModule):
         )
         return total_loss
 
+    def on_train_end(self):
+        """Automatically build index after training"""
+        if self.trainer.datamodule is not None:
+            train_adata = self.trainer.datamodule.train_data
+            train_embeddings = self.get_latent_embedding(train_adata)
+            self.build_similarity_index(train_adata)
+            
+    def build_similarity_index(self, adata: ad.AnnData):
+        """Build similarity index from training data"""
+        embeddings = self.get_latent_embedding(adata)
+        self.embedding_store.build_index(
+            embeddings=embeddings,
+            labels=adata.obs[self.hparams.label_key].values,
+            sample_ids=adata.obs_names.values
+        )
+    
+    def query_similar(
+        self,
+        query: Union[ad.AnnData, torch.Tensor],
+        k: int = 5,
+        label_filter: str = None
+    ) -> dict:
+        """
+        Query similar samples from the trained model
+        
+        Args:
+            query: Either AnnData object or tensor of shape (n_samples, n_features)
+            k: Number of similar samples to retrieve
+            label_filter: Only return samples with this label
+            
+        Returns:
+            Dictionary containing similar samples' information
+        """
+        if isinstance(query, ad.AnnData):
+            query_embedding = self.get_latent_embedding(query)
+        else:
+            self.eval()
+            with torch.no_grad():
+                query_embedding = self.encoder(query.to(self.device)).cpu().numpy()
+                
+        return self.embedding_store.query(query_embedding, k, label_filter)
+
     def get_latent_embedding(
         self,
         adata: ad.AnnData,
         layer: str = None,
         label_key: str = "cell_type",
         batch_size: int = 256,
+        store_in_adata: bool = True,
     ):
         """
         Generate latent embeddings for an AnnData object
@@ -309,6 +433,7 @@ class ContrastiveAE(pl.LightningModule):
             layer: Layer to use (default: .X)
             label_key: Key for pseudo-labels (will create dummy if missing)
             batch_size: Batch size for inference
+            store_in_adata: Whether to store embeddings in adata.obsm['X_latent']
 
         Returns:
             numpy array of latent embeddings (cells x latent_dim)
@@ -359,4 +484,9 @@ class ContrastiveAE(pl.LightningModule):
                 z = self.encoder(x)
                 embeddings.append(z.cpu().numpy())
 
-        return np.concatenate(embeddings, axis=0)
+        embeddings = np.concatenate(embeddings, axis=0)
+        
+        if store_in_adata:
+            adata.obsm['X_latent'] = embeddings
+            
+        return embeddings
