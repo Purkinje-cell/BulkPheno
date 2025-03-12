@@ -12,6 +12,7 @@ import squidpy as sq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from anndata import AnnData
 from networkx import subgraph
 from scvi import REGISTRY_KEYS
@@ -57,6 +58,7 @@ from distribution import NegativeBinomial
 from module import BulkVAEModule
 from training_mixin import BasicTrainingMixin
 from utils import broadcast_labels, one_hot
+from dataset import ContrastiveBulkDataset
 
 
 class BulkVAE(UnsupervisedTrainingMixin, VAEMixin, BaseModelClass):
