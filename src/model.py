@@ -62,7 +62,8 @@ from dataset import ContrastiveBulkDataset
 
 class TripletLoss(nn.Module):
     """Online hard triplet mining with PyTorch's TripletMarginLoss"""
-    def __init__(self, margin=1.0, distance='euclidean'):
+
+    def __init__(self, margin=1.0, distance="euclidean"):
         super().__init__()
         self.margin = margin
         self.distance = distance
@@ -77,11 +78,11 @@ class TripletLoss(nn.Module):
 
     def _get_triplets(self, embeddings, labels):
         pairwise_dist = torch.cdist(embeddings, embeddings)
-        
+
         labels = labels.view(-1, 1)
         mask_same = labels == labels.t()
         mask_diff = ~mask_same
-        
+
         triplets = []
         for i in range(len(embeddings)):
             # Hardest positive (furthest)
@@ -103,12 +104,12 @@ class TripletLoss(nn.Module):
 
         if not triplets:
             return None
-        
+
         indices = torch.tensor(triplets, device=embeddings.device)
         return (
             embeddings[indices[:, 0]],
             embeddings[indices[:, 1]],
-            embeddings[indices[:, 2]]
+            embeddings[indices[:, 2]],
         )
 
 
@@ -205,8 +206,6 @@ class Decoder(nn.Module):
         return self.net(z)
 
 
-
-
 class ContrastiveAE(pl.LightningModule):
     def __init__(
         self,
@@ -234,7 +233,7 @@ class ContrastiveAE(pl.LightningModule):
             hidden_dims=hidden_dims,
             dropout=dropout,
         )
-        
+
         self.triplet_loss = TripletLoss(margin=margin)
         self.recon_loss = nn.MSELoss()
 
@@ -245,100 +244,112 @@ class ContrastiveAE(pl.LightningModule):
         return self.encoder(x)
 
     def training_step(self, batch, batch_idx):
-        x = batch['expression']
-        labels = batch['label']
-        
+        x = batch["expression"]
+        labels = batch["label"]
+
         # Get embeddings
         z = self.encoder(x)
-        
+
         # Calculate losses
         triplet_loss = self.triplet_loss(z, labels)
         recon = self.decoder(z)
         recon_loss = self.recon_loss(recon, x)
-        
+
         total_loss = self.hparams.recon_weight * recon_loss + triplet_loss
-        
-        self.log_dict({
-            "train_loss": total_loss,
-            "train_recon_loss": recon_loss,
-            "train_triplet_loss": triplet_loss,
-        })
+
+        self.log_dict(
+            {
+                "train_loss": total_loss,
+                "train_recon_loss": recon_loss,
+                "train_triplet_loss": triplet_loss,
+            }
+        )
         return total_loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=1e-5)
-    
+        return torch.optim.Adam(
+            self.parameters(), lr=self.hparams.lr, weight_decay=1e-5
+        )
+
     def validation_step(self, batch, batch_idx):
-        x = batch['expression']
-        labels = batch['label']
-        
+        x = batch["expression"]
+        labels = batch["label"]
+
         # Get embeddings
         z = self.encoder(x)
-        
+
         # Calculate losses
         triplet_loss = self.triplet_loss(z, labels)
         recon = self.decoder(z)
         recon_loss = self.recon_loss(recon, x)
-        
+
         total_loss = self.hparams.recon_weight * recon_loss + triplet_loss
-        
-        self.log_dict({
-            "val_loss": total_loss,
-            "val_recon_loss": recon_loss,
-            "val_triplet_loss": triplet_loss,
-        })
+
+        self.log_dict(
+            {
+                "val_loss": total_loss,
+                "val_recon_loss": recon_loss,
+                "val_triplet_loss": triplet_loss,
+            }
+        )
         return total_loss
-        
-    def get_latent_embedding(self, adata: ad.AnnData, layer: str = None, label_key: str = 'cell_type', batch_size: int = 256):
+
+    def get_latent_embedding(
+        self,
+        adata: ad.AnnData,
+        layer: str = None,
+        label_key: str = "cell_type",
+        batch_size: int = 256,
+    ):
         """
         Generate latent embeddings for an AnnData object
-        
+
         Args:
             adata: AnnData containing expression data
             layer: Layer to use (default: .X)
             label_key: Key for pseudo-labels (will create dummy if missing)
             batch_size: Batch size for inference
-            
+
         Returns:
             numpy array of latent embeddings (cells x latent_dim)
         """
         # Create copy to avoid modifying original data
         temp_adata = adata.copy()
-        
+
         # Add dummy labels if needed
         if label_key not in temp_adata.obs:
-            temp_adata.obs[label_key] = 'dummy'
-            
+            temp_adata.obs[label_key] = "dummy"
+
         # Create a simple dataset for inference (not triplet-based)
         class SimpleDataset(Dataset):
             def __init__(self, adata, layer=None):
                 self.adata = adata
                 self.layer = layer
-                
+
             def __len__(self):
                 return self.adata.shape[0]
-                
+
             def __getitem__(self, idx):
                 if self.layer:
                     expr = self.adata.layers[self.layer][idx]
                 else:
                     expr = self.adata.X[idx]
-                
+
                 # Handle sparse matrices
-                if hasattr(expr, 'toarray'):
+                if hasattr(expr, "toarray"):
                     expr = expr.toarray().squeeze()
-                    
+
                 return torch.tensor(expr, dtype=torch.float32)
-        
+
         # Create dataset and dataloader
         dataset = SimpleDataset(temp_adata, layer)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=0  # No parallel workers for in-memory data
+            num_workers=0,  # No parallel workers for in-memory data
         )
-        
+
         # Collect embeddings
         embeddings = []
         self.eval()
@@ -347,5 +358,5 @@ class ContrastiveAE(pl.LightningModule):
                 x = batch.to(self.device)
                 z = self.encoder(x)
                 embeddings.append(z.cpu().numpy())
-                
+
         return np.concatenate(embeddings, axis=0)
