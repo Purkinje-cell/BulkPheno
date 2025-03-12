@@ -60,6 +60,58 @@ from torch_scatter import scatter_add
 from dataset import ContrastiveBulkDataset
 
 
+class TripletLoss(nn.Module):
+    """Online hard triplet mining with PyTorch's TripletMarginLoss"""
+    def __init__(self, margin=1.0, distance='euclidean'):
+        super().__init__()
+        self.margin = margin
+        self.distance = distance
+        self.loss_fn = nn.TripletMarginLoss(margin=margin, p=2)
+
+    def forward(self, embeddings, labels):
+        """Compute loss using hardest triplets in batch"""
+        triplets = self._get_triplets(embeddings, labels)
+        if triplets is None or len(triplets) == 0:
+            return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
+        return self.loss_fn(*triplets)
+
+    def _get_triplets(self, embeddings, labels):
+        pairwise_dist = torch.cdist(embeddings, embeddings)
+        
+        labels = labels.view(-1, 1)
+        mask_same = labels == labels.t()
+        mask_diff = ~mask_same
+        
+        triplets = []
+        for i in range(len(embeddings)):
+            # Hardest positive (furthest)
+            pos_mask = mask_same[i]
+            pos_mask[i] = False  # Exclude self
+            if not pos_mask.any():
+                continue
+            hardest_pos = torch.argmax(pairwise_dist[i][pos_mask]).item()
+            pos_idx = torch.where(pos_mask)[0][hardest_pos]
+
+            # Hardest negative (closest)
+            neg_mask = mask_diff[i]
+            if not neg_mask.any():
+                continue
+            hardest_neg = torch.argmin(pairwise_dist[i][neg_mask]).item()
+            neg_idx = torch.where(neg_mask)[0][hardest_neg]
+
+            triplets.append((i, pos_idx, neg_idx))
+
+        if not triplets:
+            return None
+        
+        indices = torch.tensor(triplets, device=embeddings.device)
+        return (
+            embeddings[indices[:, 0]],
+            embeddings[indices[:, 1]],
+            embeddings[indices[:, 2]]
+        )
+
+
 # class BulkVAE(UnsupervisedTrainingMixin, VAEMixin, BaseModelClass):
 #     def __init__(
 #         self,
@@ -182,6 +234,9 @@ class ContrastiveAE(pl.LightningModule):
             hidden_dims=hidden_dims,
             dropout=dropout,
         )
+        
+        self.triplet_loss = TripletLoss(margin=margin)
+        self.recon_loss = nn.MSELoss()
 
     def forward(self, x):
         return self.decoder(self.encoder(x))
@@ -190,23 +245,16 @@ class ContrastiveAE(pl.LightningModule):
         return self.encoder(x)
 
     def training_step(self, batch, batch_idx):
-        anchor = batch['anchor']
-        positive = batch['positive']
-        negative = batch['negative']
+        x = batch['expression']
+        labels = batch['label']
         
         # Get embeddings
-        z_anchor = self.encoder(anchor)
-        z_pos = self.encoder(positive)
-        z_neg = self.encoder(negative)
+        z = self.encoder(x)
         
-        # Triplet loss calculation
-        pos_dist = F.mse_loss(z_anchor, z_pos)
-        neg_dist = F.mse_loss(z_anchor, z_neg)
-        triplet_loss = F.relu(pos_dist - neg_dist + self.hparams.margin)
-        
-        # Reconstruction loss
-        recon_anchor = self.decoder(z_anchor)
-        recon_loss = F.mse_loss(recon_anchor, anchor)
+        # Calculate losses
+        triplet_loss = self.triplet_loss(z, labels)
+        recon = self.decoder(z)
+        recon_loss = self.recon_loss(recon, x)
         
         total_loss = self.hparams.recon_weight * recon_loss + triplet_loss
         
@@ -219,6 +267,27 @@ class ContrastiveAE(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=1e-5)
+    
+    def validation_step(self, batch, batch_idx):
+        x = batch['expression']
+        labels = batch['label']
+        
+        # Get embeddings
+        z = self.encoder(x)
+        
+        # Calculate losses
+        triplet_loss = self.triplet_loss(z, labels)
+        recon = self.decoder(z)
+        recon_loss = self.recon_loss(recon, x)
+        
+        total_loss = self.hparams.recon_weight * recon_loss + triplet_loss
+        
+        self.log_dict({
+            "val_loss": total_loss,
+            "val_recon_loss": recon_loss,
+            "val_triplet_loss": triplet_loss,
+        })
+        return total_loss
         
     def get_latent_embedding(self, adata: ad.AnnData, layer: str = None, label_key: str = 'cell_type', batch_size: int = 256):
         """
