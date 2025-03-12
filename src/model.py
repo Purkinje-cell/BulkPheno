@@ -379,7 +379,6 @@ class ContrastiveAE(pl.LightningModule):
         """Automatically build index after training"""
         if self.trainer.datamodule is not None:
             train_adata = self.trainer.datamodule.train_data
-            train_embeddings = self.get_latent_embedding(train_adata)
             self.build_similarity_index(train_adata)
             
     def build_similarity_index(self, adata: ad.AnnData):
