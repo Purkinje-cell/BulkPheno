@@ -12,7 +12,7 @@ import squidpy as sq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from anndata import AnnData
 from networkx import subgraph
 from scvi import REGISTRY_KEYS
