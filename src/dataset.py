@@ -96,38 +96,68 @@ class ContrastiveBulkDataset(Dataset):
 
 
 class ContrastiveDataModule(pl.LightningDataModule):
-    """Lightning DataModule for contrastive bulk RNA experiments"""
-    def __init__(self, adata_path: str, label_key: str = 'cell_type', layer: str = None,
-                 batch_size: int = 128, num_workers: int = 4,
-                 val_size: float = 0.1, test_size: float = 0.1):
+    """Lightning DataModule for contrastive bulk RNA experiments with in-memory AnnData"""
+    def __init__(self, 
+                 adata: ad.AnnData,
+                 label_key: str = 'cell_type',
+                 layer: str = None,
+                 batch_size: int = 128,
+                 num_workers: int = 4,
+                 val_size: float = 0.1,
+                 test_size: float = 0.0,
+                 filter_genes: bool = True,
+                 normalize: bool = True,
+                 log1p: bool = True):
         super().__init__()
-        self.adata_path = adata_path
+        self.adata = adata
         self.label_key = label_key
         self.layer = layer
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.val_size = val_size
         self.test_size = test_size
+        self.filter_genes = filter_genes
+        self.normalize = normalize
+        self.log1p = log1p
 
     def prepare_data(self):
-        # Load the full AnnData once
-        self.adata = ad.read(self.adata_path)
+        # Create a copy to avoid modifying original object
+        self.adata = self.adata.copy()
         
         # Basic preprocessing
-        sc.pp.filter_genes(self.adata, min_counts=1)
-        sc.pp.normalize_total(self.adata)
-        sc.pp.log1p(self.adata)
+        if self.filter_genes:
+            sc.pp.filter_genes(self.adata, min_counts=1)
+        if self.normalize:
+            sc.pp.normalize_total(self.adata, target_sum=1e4)
+        if self.log1p:
+            sc.pp.log1p(self.adata)
 
     def setup(self, stage=None):
-        # Split indices
         indices = np.arange(self.adata.shape[0])
-        train_idx, test_idx = train_test_split(indices, test_size=self.test_size)
-        train_idx, val_idx = train_test_split(train_idx, test_size=self.val_size/(1-self.test_size))
+        test_size = self.test_size if self.test_size > 0 else 0
         
-        # Create subset AnnData objects
+        # First split test if needed
+        if test_size > 0:
+            train_idx, test_idx = train_test_split(
+                indices, 
+                test_size=test_size,
+                stratify=self.adata.obs[self.label_key]
+            )
+            self.test_data = self.adata[test_idx]
+            indices = train_idx  # Remaining indices are for train/val
+        else:
+            self.test_data = None
+
+        # Split remaining into train/val
+        val_ratio = self.val_size / (1 - test_size) if test_size > 0 else self.val_size
+        train_idx, val_idx = train_test_split(
+            indices, 
+            test_size=val_ratio,
+            stratify=self.adata[indices].obs[self.label_key]
+        )
+        
         self.train_data = self.adata[train_idx]
         self.val_data = self.adata[val_idx]
-        self.test_data = self.adata[test_idx]
 
     def train_dataloader(self):
         return DataLoader(
@@ -146,8 +176,10 @@ class ContrastiveDataModule(pl.LightningDataModule):
         )
 
     def test_dataloader(self):
-        return DataLoader(
-            ContrastiveBulkDataset(self.test_data, self.label_key, self.layer),
-            batch_size=self.batch_size,
-            num_workers=self.num_workers
-        )
+        if self.test_data is not None:
+            return DataLoader(
+                ContrastiveBulkDataset(self.test_data, self.label_key, self.layer),
+                batch_size=self.batch_size,
+                num_workers=self.num_workers
+            )
+        return None
