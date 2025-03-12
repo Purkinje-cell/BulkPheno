@@ -213,7 +213,13 @@ class ContrastiveAE(pl.LightningModule):
         return self.encoder(x)
 
     def training_step(self, batch, batch_idx):
-        x, labels = batch
+        # Handle both dictionary and tuple batch formats
+        if isinstance(batch, dict):
+            x = batch['expression']
+            labels = batch['label']
+        else:
+            x, labels = batch
+            
         z = self.encoder(x)
         x_hat = self.decoder(z)
 
