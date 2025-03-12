@@ -238,3 +238,43 @@ class ContrastiveAE(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        
+    def get_latent_embedding(self, adata: ad.AnnData, layer: str = None, label_key: str = 'cell_type', batch_size: int = 256):
+        """
+        Generate latent embeddings for an AnnData object
+        
+        Args:
+            adata: AnnData containing expression data
+            layer: Layer to use (default: .X)
+            label_key: Key for pseudo-labels (will create dummy if missing)
+            batch_size: Batch size for inference
+            
+        Returns:
+            numpy array of latent embeddings (cells x latent_dim)
+        """
+        # Create copy to avoid modifying original data
+        temp_adata = adata.copy()
+        
+        # Add dummy labels if needed
+        if label_key not in temp_adata.obs:
+            temp_adata.obs[label_key] = 'dummy'
+            
+        # Create dataset and dataloader
+        dataset = ContrastiveBulkDataset(temp_adata, label_key, layer)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0  # No parallel workers for in-memory data
+        )
+        
+        # Collect embeddings
+        embeddings = []
+        self.eval()
+        with torch.no_grad():
+            for batch in dataloader:
+                x = batch['expression'].to(self.device)
+                z = self.encoder(x)
+                embeddings.append(z.cpu().numpy())
+                
+        return np.concatenate(embeddings, axis=0)
