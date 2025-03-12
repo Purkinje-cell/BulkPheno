@@ -185,3 +185,48 @@ class ContrastiveDataModule(pl.LightningDataModule):
                 num_workers=self.num_workers
             )
         return None
+
+
+class PhenotypeDataModule(pl.LightningDataModule):
+    """Handles bulk data with precomputed single-cell embeddings"""
+    def __init__(
+        self,
+        bulk_adata: ad.AnnData,
+        sc_embeddings: torch.Tensor,
+        label_key: str = 'phenotype',
+        layer: str = None,
+        batch_size: int = 32,
+        num_workers: int = 4,
+    ):
+        super().__init__()
+        self.bulk_adata = bulk_adata
+        self.sc_embeddings = sc_embeddings
+        self.label_key = label_key
+        self.layer = layer
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+    def setup(self, stage=None):
+        # Create bulk dataset with phenotype labels
+        self.bulk_dataset = ContrastiveBulkDataset(
+            self.bulk_adata,
+            label_key=self.label_key,
+            layer=self.layer
+        )
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.bulk_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
+            collate_fn=self.collate_fn
+        )
+
+    def collate_fn(self, batch):
+        expressions = [item['expression'] for item in batch]
+        labels = [item['label'] for item in batch]
+        return (
+            torch.stack(expressions),
+            torch.stack(labels)
+        )

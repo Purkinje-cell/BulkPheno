@@ -12,7 +12,6 @@ import squidpy as sq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from sklearn.neighbors import NearestNeighbors
 try:
     import faiss
@@ -64,6 +63,35 @@ from torch_scatter import scatter_add
 # from training_mixin import BasicTrainingMixin
 # from utils import broadcast_labels, one_hot
 from dataset import ContrastiveBulkDataset
+
+
+class FullCrossAttention(nn.Module):
+    """Attention using all single-cell embeddings simultaneously"""
+    def __init__(self, embed_dim: int, num_heads: int = 8):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_first=True
+        )
+        
+    def forward(self, bulk_embeddings, sc_embeddings):
+        """
+        Args:
+            bulk_embeddings: (batch_size, embed_dim)
+            sc_embeddings: (num_sc_cells, embed_dim) - fixed for all batches
+        """
+        # Expand sc embeddings for batch processing
+        sc_embeddings = sc_embeddings.unsqueeze(0).repeat(bulk_embeddings.size(0), 1, 1)  # (B, N, D)
+        
+        # Attention computation
+        attn_output, attn_weights = self.attention(
+            query=bulk_embeddings.unsqueeze(1),
+            key=sc_embeddings,
+            value=sc_embeddings
+        )
+        
+        return attn_output.squeeze(1), attn_weights  # (B, D), (B, 1, N)
 
 
 class EmbeddingStore:
@@ -489,3 +517,94 @@ class ContrastiveAE(pl.LightningModule):
             adata.obsm['X_latent'] = embeddings
             
         return embeddings
+
+
+class PhenotypeAttentionModel(pl.LightningModule):
+    """Identifies phenotype-associated niches using full attention"""
+    def __init__(
+        self,
+        input_dim: int,
+        sc_embed_dim: int,
+        latent_dim: int = 128,
+        hidden_dims: list = [512, 256],
+        margin: float = 1.0,
+        recon_weight: float = 1.0,
+        lr: float = 1e-3,
+        dropout: float = 0.2,
+        num_attention_heads: int = 8,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        # Bulk processing components
+        self.bulk_encoder = Encoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+        )
+        
+        # Attention mechanism
+        self.attention = FullCrossAttention(
+            embed_dim=latent_dim,
+            num_heads=num_attention_heads
+        )
+        
+        # Reconstruction decoder
+        self.decoder = Decoder(
+            latent_dim=latent_dim,
+            output_dim=input_dim,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+        )
+        
+        # Loss components
+        self.triplet_loss = TripletLoss(margin=margin)
+        self.recon_loss = nn.MSELoss()
+        
+        # Will be initialized during setup
+        self.sc_embeddings = None
+
+    def forward(self, bulk_x):
+        bulk_z = self.bulk_encoder(bulk_x)
+        attended_z, attn_weights = self.attention(bulk_z, self.sc_embeddings)
+        recon_x = self.decoder(attended_z)
+        return attended_z, recon_x, attn_weights
+
+    def setup_sc_embeddings(self, sc_embeddings: torch.Tensor):
+        """Register single-cell embeddings as buffer"""
+        self.register_buffer('sc_embeddings', sc_embeddings)
+
+    def training_step(self, batch, batch_idx):
+        bulk_x, phenotype_labels = batch
+        
+        # Forward pass
+        attended_z, recon_x, _ = self(bulk_x)
+        
+        # Reconstruction loss
+        recon_loss = self.recon_loss(recon_x, bulk_x)
+        
+        # Triplet loss on phenotype labels
+        triplet_loss = self.triplet_loss(attended_z, phenotype_labels)
+        
+        total_loss = self.hparams.recon_weight * recon_loss + triplet_loss
+        
+        self.log_dict({
+            "train_loss": total_loss,
+            "train_recon_loss": recon_loss,
+            "train_triplet_loss": triplet_loss,
+        })
+        return total_loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(
+            self.parameters(), 
+            lr=self.hparams.lr, 
+            weight_decay=1e-5
+        )
+
+    def get_attention_weights(self, bulk_x):
+        """Retrieve attention weights for interpretation"""
+        with torch.no_grad():
+            _, _, attn_weights = self(bulk_x)
+        return attn_weights.squeeze(1)  # (batch_size, num_sc_cells)
