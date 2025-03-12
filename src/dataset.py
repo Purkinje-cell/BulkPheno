@@ -7,9 +7,6 @@ import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 
-from utils import one_hot
-
-
 class TripletSelector:
     """Precomputes triplets for contrastive learning"""
     def __init__(self, margin: float = 1.0, samples_per_anchor: int = 5):
