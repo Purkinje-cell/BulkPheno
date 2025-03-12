@@ -10,6 +10,41 @@ from sklearn.model_selection import train_test_split
 from utils import one_hot
 
 
+class TripletSelector:
+    """Precomputes triplets for contrastive learning"""
+    def __init__(self, margin: float = 1.0, samples_per_anchor: int = 5):
+        self.margin = margin
+        self.samples_per_anchor = samples_per_anchor
+
+    def generate_triplets(self, labels: np.ndarray):
+        """Generate anchor-positive-negative triplets"""
+        triplets = []
+        class_indices = {}
+        
+        # Group indices by class
+        for idx, label in enumerate(labels):
+            class_indices.setdefault(label, []).append(idx)
+            
+        # Generate triplets for each anchor
+        for class_id, indices in class_indices.items():
+            # Get negative class IDs
+            neg_classes = [c for c in class_indices if c != class_id]
+            
+            for anchor_idx in indices:
+                # Generate multiple positives/negatives per anchor
+                for _ in range(self.samples_per_anchor):
+                    # Select positive from same class (excluding self)
+                    positive_idx = np.random.choice([i for i in indices if i != anchor_idx])
+                    
+                    # Select negative from different class
+                    neg_class = np.random.choice(neg_classes)
+                    negative_idx = np.random.choice(class_indices[neg_class])
+                    
+                    triplets.append((anchor_idx, positive_idx, negative_idx))
+                    
+        return np.array(triplets)
+
+
 class TCGADataset(Dataset):
     """
     Dataset for TCGA bulk expression data
@@ -59,15 +94,18 @@ def collate_fn(batch):
 
 
 class ContrastiveBulkDataset(Dataset):
-    """Dataset for contrastive learning with bulk RNA-seq AnnData"""
-    def __init__(self, adata: ad.AnnData, label_key: str = 'cell_type', layer: str = None):
+    """Dataset for precomputed triplets"""
+    def __init__(self, adata: ad.AnnData, triplet_indices: np.ndarray, 
+                 label_key: str = 'cell_type', layer: str = None):
         """
         Args:
             adata: AnnData object containing bulk RNA data
+            triplet_indices: Precomputed triplet indices (anchor, positive, negative)
             label_key: Key in adata.obs containing biological labels
             layer: Layer in AnnData to use (default: .X)
         """
         self.adata = adata
+        self.triplet_indices = triplet_indices
         self.label_key = label_key
         self.layer = layer
         
@@ -76,22 +114,28 @@ class ContrastiveBulkDataset(Dataset):
         self.n_classes = len(pd.Categorical(adata.obs[label_key]).categories)
 
     def __len__(self):
-        return self.adata.shape[0]
+        return len(self.triplet_indices)
 
     def __getitem__(self, idx):
-        # Get expression data
-        if self.layer:
-            expr = self.adata.layers[self.layer][idx]
-        else:
-            expr = self.adata.X[idx]
+        anchor_idx, pos_idx, neg_idx = self.triplet_indices[idx]
         
-        # Handle sparse matrices
-        if hasattr(expr, 'toarray'):
-            expr = expr.toarray().squeeze()
+        def get_expression(index):
+            if self.layer:
+                expr = self.adata.layers[self.layer][index]
+            else:
+                expr = self.adata.X[index]
             
+            # Handle sparse matrices
+            if hasattr(expr, 'toarray'):
+                expr = expr.toarray().squeeze()
+                
+            return torch.tensor(expr, dtype=torch.float32)
+        
         return {
-            'expression': torch.tensor(expr, dtype=torch.float32),
-            'label': torch.tensor(self.labels[idx], dtype=torch.long)
+            'anchor': get_expression(anchor_idx),
+            'positive': get_expression(pos_idx),
+            'negative': get_expression(neg_idx),
+            'label': torch.tensor(self.labels[anchor_idx], dtype=torch.long)
         }
 
 
@@ -107,7 +151,9 @@ class ContrastiveDataModule(pl.LightningDataModule):
                  test_size: float = 0.0,
                  filter_genes: bool = False,
                  normalize: bool = False,
-                 log1p: bool = False):
+                 log1p: bool = False,
+                 triplet_margin: float = 1.0,
+                 samples_per_anchor: int = 5):
         super().__init__()
         self.adata = adata
         self.label_key = label_key
@@ -119,6 +165,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
         self.filter_genes = filter_genes
         self.normalize = normalize
         self.log1p = log1p
+        self.triplet_margin = triplet_margin
+        self.samples_per_anchor = samples_per_anchor
 
     def prepare_data(self):
         # Create a copy to avoid modifying original object
@@ -158,10 +206,27 @@ class ContrastiveDataModule(pl.LightningDataModule):
         
         self.train_data = self.adata[train_idx]
         self.val_data = self.adata[val_idx]
+        
+        # Generate triplets after splitting
+        selector = TripletSelector(margin=self.triplet_margin,
+                                  samples_per_anchor=self.samples_per_anchor)
+        
+        # Process each split
+        self.train_triplets = selector.generate_triplets(
+            pd.Categorical(self.train_data.obs[self.label_key]).codes
+        )
+        self.val_triplets = selector.generate_triplets(
+            pd.Categorical(self.val_data.obs[self.label_key]).codes
+        )
+        if self.test_data is not None:
+            self.test_triplets = selector.generate_triplets(
+                pd.Categorical(self.test_data.obs[self.label_key]).codes
+            )
 
     def train_dataloader(self):
         return DataLoader(
-            ContrastiveBulkDataset(self.train_data, self.label_key, self.layer),
+            ContrastiveBulkDataset(self.train_data, self.train_triplets, 
+                                  self.label_key, self.layer),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=True,
@@ -170,7 +235,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(
-            ContrastiveBulkDataset(self.val_data, self.label_key, self.layer),
+            ContrastiveBulkDataset(self.val_data, self.val_triplets,
+                                  self.label_key, self.layer),
             batch_size=self.batch_size,
             num_workers=self.num_workers
         )
@@ -178,7 +244,8 @@ class ContrastiveDataModule(pl.LightningDataModule):
     def test_dataloader(self):
         if self.test_data is not None:
             return DataLoader(
-                ContrastiveBulkDataset(self.test_data, self.label_key, self.layer),
+                ContrastiveBulkDataset(self.test_data, self.test_triplets,
+                                      self.label_key, self.layer),
                 batch_size=self.batch_size,
                 num_workers=self.num_workers
             )

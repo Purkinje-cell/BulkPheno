@@ -154,28 +154,6 @@ class Decoder(nn.Module):
         return self.net(z)
 
 
-class TripletSelector(nn.Module):
-    def __init__(self, margin: float = 1.0):
-        super().__init__()
-        self.margin = margin
-
-    def forward(self, embeddings, labels):
-        pairwise_dist = F.pairwise_distance(
-            embeddings.unsqueeze(1), embeddings.unsqueeze(0), p=2
-        )
-
-        label_mask = labels.unsqueeze(1) == labels.unsqueeze(0)
-        eye_mask = ~torch.eye(len(labels), dtype=torch.bool, device=embeddings.device)
-
-        pos_dist = pairwise_dist[label_mask & eye_mask]
-        neg_dist = pairwise_dist[~label_mask]
-
-        if len(pos_dist) == 0 or len(neg_dist) == 0:
-            return torch.tensor(0.0, device=embeddings.device)
-
-        hardest_pos = pos_dist.max()
-        hardest_neg = neg_dist.min()
-        return F.relu(hardest_pos - hardest_neg + self.margin)
 
 
 class ContrastiveAE(pl.LightningModule):
@@ -206,8 +184,6 @@ class ContrastiveAE(pl.LightningModule):
             dropout=dropout,
         )
 
-        self.triplet_selector = TripletSelector(margin=margin)
-
     def forward(self, x):
         return self.decoder(self.encoder(x))
 
@@ -215,27 +191,31 @@ class ContrastiveAE(pl.LightningModule):
         return self.encoder(x)
 
     def training_step(self, batch, batch_idx):
-        # Handle both dictionary and tuple batch formats
-        if isinstance(batch, dict):
-            x = batch['expression']
-            labels = batch['label']
-        else:
-            x, labels = batch
-            
-        z = self.encoder(x)
-        x_hat = self.decoder(z)
-
-        recon_loss = F.mse_loss(x_hat, x)
-        triplet_loss = self.triplet_selector(z, labels)
+        anchor = batch['anchor']
+        positive = batch['positive']
+        negative = batch['negative']
+        
+        # Get embeddings
+        z_anchor = self.encoder(anchor)
+        z_pos = self.encoder(positive)
+        z_neg = self.encoder(negative)
+        
+        # Triplet loss calculation
+        pos_dist = F.mse_loss(z_anchor, z_pos)
+        neg_dist = F.mse_loss(z_anchor, z_neg)
+        triplet_loss = F.relu(pos_dist - neg_dist + self.hparams.margin)
+        
+        # Reconstruction loss
+        recon_anchor = self.decoder(z_anchor)
+        recon_loss = F.mse_loss(recon_anchor, anchor)
+        
         total_loss = self.hparams.recon_weight * recon_loss + triplet_loss
-
-        self.log_dict(
-            {
-                "train_loss": total_loss,
-                "train_recon_loss": recon_loss,
-                "train_triplet_loss": triplet_loss,
-            }
-        )
+        
+        self.log_dict({
+            "train_loss": total_loss,
+            "train_recon_loss": recon_loss,
+            "train_triplet_loss": triplet_loss,
+        })
         return total_loss
 
     def configure_optimizers(self):
@@ -261,8 +241,29 @@ class ContrastiveAE(pl.LightningModule):
         if label_key not in temp_adata.obs:
             temp_adata.obs[label_key] = 'dummy'
             
+        # Create a simple dataset for inference (not triplet-based)
+        class SimpleDataset(Dataset):
+            def __init__(self, adata, layer=None):
+                self.adata = adata
+                self.layer = layer
+                
+            def __len__(self):
+                return self.adata.shape[0]
+                
+            def __getitem__(self, idx):
+                if self.layer:
+                    expr = self.adata.layers[self.layer][idx]
+                else:
+                    expr = self.adata.X[idx]
+                
+                # Handle sparse matrices
+                if hasattr(expr, 'toarray'):
+                    expr = expr.toarray().squeeze()
+                    
+                return torch.tensor(expr, dtype=torch.float32)
+        
         # Create dataset and dataloader
-        dataset = ContrastiveBulkDataset(temp_adata, label_key, layer)
+        dataset = SimpleDataset(temp_adata, layer)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -275,7 +276,7 @@ class ContrastiveAE(pl.LightningModule):
         self.eval()
         with torch.no_grad():
             for batch in dataloader:
-                x = batch['expression'].to(self.device)
+                x = batch.to(self.device)
                 z = self.encoder(x)
                 embeddings.append(z.cpu().numpy())
                 
