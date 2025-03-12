@@ -3,6 +3,7 @@ from typing import Callable, Iterable, Literal
 
 
 import anndata as ad
+import pytorch_lightning as pl
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -104,10 +105,114 @@ class BulkVAE(UnsupervisedTrainingMixin, VAEMixin, BaseModelClass):
 
 
 class ContrastiveAE(pl.LightningModule):
-    def __init__(self):
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int = 128,
+        hidden_dims: list = [512, 256],
+        margin: float = 1.0,
+        recon_weight: float = 1.0,
+        lr: float = 1e-3,
+    ):
         super().__init__()
+        self.save_hyperparameters()
+        
+        # Encoder network
+        encoder_layers = []
+        prev_dim = input_dim
+        for h_dim in hidden_dims:
+            encoder_layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.BatchNorm1d(h_dim),
+                nn.ReLU(),
+                nn.Dropout(0.2)
+            ])
+            prev_dim = h_dim
+        encoder_layers.append(nn.Linear(prev_dim, latent_dim))
+        self.encoder = nn.Sequential(*encoder_layers)
+
+        # Decoder network
+        decoder_layers = []
+        prev_dim = latent_dim
+        for h_dim in reversed(hidden_dims):
+            decoder_layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.BatchNorm1d(h_dim),
+                nn.ReLU(),
+                nn.Dropout(0.2)
+            ])
+            prev_dim = h_dim
+        decoder_layers.append(nn.Linear(prev_dim, input_dim))
+        self.decoder = nn.Sequential(*decoder_layers)
 
     def forward(self, x):
         z = self.encoder(x)
         x_hat = self.decoder(z)
         return x_hat
+
+    def encode(self, x):
+        return self.encoder(x)
+
+    def training_step(self, batch, batch_idx):
+        x, labels = batch
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
+        
+        # Reconstruction loss
+        recon_loss = F.mse_loss(x_hat, x)
+        
+        # Triplet loss
+        triplet_loss = self._compute_triplet_loss(z, labels)
+        
+        # Total loss
+        total_loss = self.hparams.recon_weight * recon_loss + triplet_loss
+        
+        self.log('train_loss', total_loss)
+        self.log('train_recon_loss', recon_loss)
+        self.log('train_triplet_loss', triplet_loss)
+        return total_loss
+
+    def _compute_triplet_loss(self, embeddings, labels):
+        pairwise_dist = F.pairwise_distance(
+            embeddings.unsqueeze(1), 
+            embeddings.unsqueeze(0), 
+            p=2
+        )
+        
+        # Create mask for positive and negative pairs
+        label_mask = labels.unsqueeze(1) == labels.unsqueeze(0)
+        eye_mask = ~torch.eye(len(labels), dtype=torch.bool, device=embeddings.device)
+        
+        # Hard negative mining
+        pos_dist = pairwise_dist[label_mask & eye_mask]
+        neg_dist = pairwise_dist[~label_mask]
+        
+        if len(pos_dist) == 0 or len(neg_dist) == 0:
+            return torch.tensor(0.0, device=embeddings.device)
+            
+        hardest_pos = pos_dist.max()
+        hardest_neg = neg_dist.min()
+        return F.relu(hardest_pos - hardest_neg + self.hparams.margin)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+    @classmethod
+    def setup_anndata(
+        cls,
+        adata: AnnData,
+        label_key: str,
+        layer: str = None,
+        **kwargs,
+    ):
+        anndata_fields = [
+            LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=False),
+            CategoricalObsField(REGISTRY_KEYS.LABELS_KEY, label_key),
+        ]
+        
+        adata_manager = AnnDataManager(
+            fields=anndata_fields, 
+            setup_method_args={'layer': layer, 'label_key': label_key}
+        )
+        adata_manager.register_fields(adata, **kwargs)
+        cls.register_manager(adata_manager)
