@@ -564,6 +564,20 @@ class PhenotypeAttentionModel(pl.LightningModule):
         
         # Will be initialized during setup
         self.sc_embeddings = None
+        
+    def load_pretrained_components(self, contrastive_ae: ContrastiveAE):
+        """
+        Initialize encoder/decoder from pretrained ContrastiveAE model
+        Args:
+            contrastive_ae: Pretrained ContrastiveAE model instance
+        """
+        # Load encoder weights
+        self.bulk_encoder.load_state_dict(contrastive_ae.encoder.state_dict())
+        
+        # Load decoder weights
+        self.decoder.load_state_dict(contrastive_ae.decoder.state_dict())
+        
+        print("Successfully loaded pretrained encoder and decoder weights")
 
     def forward(self, bulk_x):
         bulk_z = self.bulk_encoder(bulk_x)
