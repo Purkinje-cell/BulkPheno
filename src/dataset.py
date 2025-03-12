@@ -105,9 +105,9 @@ class ContrastiveDataModule(pl.LightningDataModule):
                  num_workers: int = 4,
                  val_size: float = 0.1,
                  test_size: float = 0.0,
-                 filter_genes: bool = True,
-                 normalize: bool = True,
-                 log1p: bool = True):
+                 filter_genes: bool = False,
+                 normalize: bool = False,
+                 log1p: bool = False):
         super().__init__()
         self.adata = adata
         self.label_key = label_key
