@@ -104,6 +104,69 @@ class BulkVAE(UnsupervisedTrainingMixin, VAEMixin, BaseModelClass):
         cls.register_manager(adata_manager)
 
 
+class Encoder(nn.Module):
+    def __init__(self, input_dim: int, latent_dim: int, hidden_dims: list, dropout: float = 0.2):
+        super().__init__()
+        layers = []
+        prev_dim = input_dim
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.BatchNorm1d(h_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+            prev_dim = h_dim
+        layers.append(nn.Linear(prev_dim, latent_dim))
+        self.net = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        return self.net(x)
+
+class Decoder(nn.Module):
+    def __init__(self, latent_dim: int, output_dim: int, hidden_dims: list, dropout: float = 0.2):
+        super().__init__()
+        layers = []
+        prev_dim = latent_dim
+        for h_dim in reversed(hidden_dims):
+            layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.BatchNorm1d(h_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+            prev_dim = h_dim
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.net = nn.Sequential(*layers)
+        
+    def forward(self, z):
+        return self.net(z)
+
+class TripletSelector(nn.Module):
+    def __init__(self, margin: float = 1.0):
+        super().__init__()
+        self.margin = margin
+        
+    def forward(self, embeddings, labels):
+        pairwise_dist = F.pairwise_distance(
+            embeddings.unsqueeze(1), 
+            embeddings.unsqueeze(0), 
+            p=2
+        )
+        
+        label_mask = labels.unsqueeze(1) == labels.unsqueeze(0)
+        eye_mask = ~torch.eye(len(labels), dtype=torch.bool, device=embeddings.device)
+        
+        pos_dist = pairwise_dist[label_mask & eye_mask]
+        neg_dist = pairwise_dist[~label_mask]
+        
+        if len(pos_dist) == 0 or len(neg_dist) == 0:
+            return torch.tensor(0.0, device=embeddings.device)
+            
+        hardest_pos = pos_dist.max()
+        hardest_neg = neg_dist.min()
+        return F.relu(hardest_pos - hardest_neg + self.margin)
+
 class ContrastiveAE(pl.LightningModule):
     def __init__(
         self,
@@ -113,42 +176,29 @@ class ContrastiveAE(pl.LightningModule):
         margin: float = 1.0,
         recon_weight: float = 1.0,
         lr: float = 1e-3,
+        dropout: float = 0.2,
     ):
         super().__init__()
         self.save_hyperparameters()
         
-        # Encoder network
-        encoder_layers = []
-        prev_dim = input_dim
-        for h_dim in hidden_dims:
-            encoder_layers.extend([
-                nn.Linear(prev_dim, h_dim),
-                nn.BatchNorm1d(h_dim),
-                nn.ReLU(),
-                nn.Dropout(0.2)
-            ])
-            prev_dim = h_dim
-        encoder_layers.append(nn.Linear(prev_dim, latent_dim))
-        self.encoder = nn.Sequential(*encoder_layers)
-
-        # Decoder network
-        decoder_layers = []
-        prev_dim = latent_dim
-        for h_dim in reversed(hidden_dims):
-            decoder_layers.extend([
-                nn.Linear(prev_dim, h_dim),
-                nn.BatchNorm1d(h_dim),
-                nn.ReLU(),
-                nn.Dropout(0.2)
-            ])
-            prev_dim = h_dim
-        decoder_layers.append(nn.Linear(prev_dim, input_dim))
-        self.decoder = nn.Sequential(*decoder_layers)
+        self.encoder = Encoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            hidden_dims=hidden_dims,
+            dropout=dropout
+        )
+        
+        self.decoder = Decoder(
+            latent_dim=latent_dim,
+            output_dim=input_dim,
+            hidden_dims=hidden_dims,
+            dropout=dropout
+        )
+        
+        self.triplet_selector = TripletSelector(margin=margin)
 
     def forward(self, x):
-        z = self.encoder(x)
-        x_hat = self.decoder(z)
-        return x_hat
+        return self.decoder(self.encoder(x))
 
     def encode(self, x):
         return self.encoder(x)
@@ -158,41 +208,16 @@ class ContrastiveAE(pl.LightningModule):
         z = self.encoder(x)
         x_hat = self.decoder(z)
         
-        # Reconstruction loss
         recon_loss = F.mse_loss(x_hat, x)
-        
-        # Triplet loss
-        triplet_loss = self._compute_triplet_loss(z, labels)
-        
-        # Total loss
+        triplet_loss = self.triplet_selector(z, labels)
         total_loss = self.hparams.recon_weight * recon_loss + triplet_loss
         
-        self.log('train_loss', total_loss)
-        self.log('train_recon_loss', recon_loss)
-        self.log('train_triplet_loss', triplet_loss)
+        self.log_dict({
+            'train_loss': total_loss,
+            'train_recon_loss': recon_loss,
+            'train_triplet_loss': triplet_loss
+        })
         return total_loss
-
-    def _compute_triplet_loss(self, embeddings, labels):
-        pairwise_dist = F.pairwise_distance(
-            embeddings.unsqueeze(1), 
-            embeddings.unsqueeze(0), 
-            p=2
-        )
-        
-        # Create mask for positive and negative pairs
-        label_mask = labels.unsqueeze(1) == labels.unsqueeze(0)
-        eye_mask = ~torch.eye(len(labels), dtype=torch.bool, device=embeddings.device)
-        
-        # Hard negative mining
-        pos_dist = pairwise_dist[label_mask & eye_mask]
-        neg_dist = pairwise_dist[~label_mask]
-        
-        if len(pos_dist) == 0 or len(neg_dist) == 0:
-            return torch.tensor(0.0, device=embeddings.device)
-            
-        hardest_pos = pos_dist.max()
-        hardest_neg = neg_dist.min()
-        return F.relu(hardest_pos - hardest_neg + self.hparams.margin)
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
