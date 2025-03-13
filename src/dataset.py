@@ -262,7 +262,7 @@ class SpatialGraphDataset(InMemoryDataset):
         for node_idx in range(self.adata.shape[0]):
             # Extract k-hop subgraph with edge attributes
             subset, edge_index_sub, _, edge_mask = k_hop_subgraph(
-                node_idx, self.hops, edge_index, num_nodes=self.adata.shape[0]
+                node_idx, self.hops, edge_index, num_nodes=self.adata.shape[0], relabel_nodes=True
             )
 
             # Get spatial coordinates and features

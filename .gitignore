@@ -9,3 +9,8 @@ MUTAG/*
 processed/*
 raw/*
 *.pyc
+.aider*
+scripts/wandb/*
+scripts/lightning_logs/*
+scripts/SpatialGCL/*
+scripts/???/*

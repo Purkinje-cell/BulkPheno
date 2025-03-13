@@ -695,22 +695,22 @@ class GraphContrastiveModel(pl.LightningModule):
         g = graph.clone()
         
         # Feature permutation (row-wise shuffle)
-        if self.hparams.feature_drop_rate > 0 and torch.rand(1) < 0.5:
-            perm = torch.randperm(g.x.size(0))  # Get random permutation of node indices
-            g.x = g.x[perm]  # Shuffle node features while keeping features intact
+        # if self.hparams.feature_drop_rate > 0 and torch.rand(1) < 0.5:
+        perm = torch.randperm(g.x.size(0))  # Get random permutation of node indices
+        g.x = g.x[perm]  # Shuffle node features while keeping features intact
         
-        # Feature dropout
-        if self.hparams.feature_drop_rate > 0:
-            drop_mask = torch.rand(g.x.size(1)) < self.hparams.feature_drop_rate
-            g.x[:, drop_mask] = 0
+        # # Feature dropout
+        # if self.hparams.feature_drop_rate > 0:
+        #     drop_mask = torch.rand(g.x.size(1)) < self.hparams.feature_drop_rate
+        #     g.x[:, drop_mask] = 0
             
-        # Edge dropping
-        if self.hparams.edge_drop_rate > 0 and g.edge_index.size(1) > 0:
-            num_edges = g.edge_index.size(1)
-            keep_mask = torch.rand(num_edges) > self.hparams.edge_drop_rate
-            g.edge_index = g.edge_index[:, keep_mask]
-            if g.edge_attr is not None:
-                g.edge_attr = g.edge_attr[keep_mask]
+        # # Edge dropping
+        # if self.hparams.edge_drop_rate > 0 and g.edge_index.size(1) > 0:
+        #     num_edges = g.edge_index.size(1)
+        #     keep_mask = torch.rand(num_edges) > self.hparams.edge_drop_rate
+        #     g.edge_index = g.edge_index[:, keep_mask]
+        #     if g.edge_attr is not None:
+        #         g.edge_attr = g.edge_attr[keep_mask]
             
         return g
         
@@ -750,10 +750,12 @@ class GraphContrastiveModel(pl.LightningModule):
         
         # Reconstruction loss
         recon = self.decoder(z1)
+        recon = recon.reshape(-1)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
         
         # Total loss
         total_loss = cl_loss + self.hparams.recon_weight * recon_loss
+        # total_loss = cl_loss
         
         self.log_dict({
             'train_loss': total_loss,
