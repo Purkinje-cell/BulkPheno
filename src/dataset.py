@@ -6,6 +6,8 @@ import anndata as ad
 import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+from torch_geometric.data import Data, InMemoryDataset
+from torch_geometric.utils import k_hop_subgraph
 
 # TripletSelector class removed as we now use online hard mining
 
@@ -229,4 +231,119 @@ class PhenotypeDataModule(pl.LightningDataModule):
         return (
             torch.stack(expressions),
             torch.stack(labels)
+        )
+
+
+class SpatialGraphDataset(InMemoryDataset):
+    """Dataset for spatial transcriptomics data represented as graphs"""
+    def __init__(self, adata, hops=2, transform=None):
+        """
+        Args:
+            adata: AnnData object with spatial information
+            hops: Number of hops for subgraph extraction
+            transform: PyG transforms to apply
+        """
+        self.adata = adata
+        self.hops = hops
+        super().__init__(transform=transform)
+        self.data, self.slices = torch.load(self.processed_paths[0])
+
+    @property
+    def processed_file_names(self):
+        return ['spatial_graph_data.pt']
+
+    def process(self):
+        graphs = []
+        for node_idx in range(self.adata.shape[0]):
+            # Extract k-hop subgraph with edge attributes
+            subset, edge_index, _, edge_mask = k_hop_subgraph(
+                node_idx, 
+                self.hops, 
+                self.adata.obsp['spatial_connectivities'],
+                num_nodes=self.adata.shape[0]
+            )
+            
+            # Get spatial coordinates and features
+            spatial_coords = torch.tensor(self.adata.obsm['spatial'][subset], dtype=torch.float)
+            features = torch.tensor(self.adata.X[subset].toarray(), dtype=torch.float)
+            
+            # Calculate reconstruction target
+            mean_expression = features.mean(dim=0)
+            
+            # Create graph data object
+            graph = Data(
+                x=features,
+                edge_index=edge_index,
+                edge_attr=torch.tensor(
+                    self.adata.obsp['spatial_distances'][edge_mask].data, 
+                    dtype=torch.float
+                ),
+                pos=spatial_coords,
+                center_node_idx=node_idx,
+                mean_expression=mean_expression
+            )
+            graphs.append(graph)
+        
+        torch.save(self.collate(graphs), self.processed_paths[0])
+
+
+class GraphContrastiveDataModule(pl.LightningDataModule):
+    """DataModule for spatial graph contrastive learning"""
+    def __init__(self, adata, hops=2, batch_size=64, num_workers=4,
+                 feature_drop_rate=0.1, edge_drop_rate=0.2):
+        super().__init__()
+        self.adata = adata
+        self.hops = hops
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.feature_drop_rate = feature_drop_rate
+        self.edge_drop_rate = edge_drop_rate
+        self.dataset = None
+
+    def prepare_data(self):
+        # Create the dataset
+        self.dataset = SpatialGraphDataset(self.adata, hops=self.hops)
+
+    def setup(self, stage=None):
+        if self.dataset is None:
+            self.prepare_data()
+            
+        # 90-10 train-val split
+        train_size = int(0.9 * len(self.dataset))
+        self.train_data = self.dataset[:train_size]
+        self.val_data = self.dataset[train_size:]
+
+    def _augment_graph(self, graph):
+        """Apply biologically plausible augmentations"""
+        # Create a clone to avoid modifying original
+        g = graph.clone()
+        
+        # Feature dropout
+        if self.feature_drop_rate > 0:
+            drop_mask = torch.rand(g.x.size(1)) < self.feature_drop_rate
+            g.x[:, drop_mask] = 0
+            
+        # Edge dropping
+        if self.edge_drop_rate > 0 and g.edge_index.size(1) > 0:
+            num_edges = g.edge_index.size(1)
+            keep_mask = torch.rand(num_edges) > self.edge_drop_rate
+            g.edge_index = g.edge_index[:, keep_mask]
+            if g.edge_attr is not None:
+                g.edge_attr = g.edge_attr[keep_mask]
+            
+        return g
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_data,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_data,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers
         )

@@ -622,3 +622,163 @@ class PhenotypeAttentionModel(pl.LightningModule):
         with torch.no_grad():
             _, _, attn_weights = self(bulk_x)
         return attn_weights.squeeze(1)  # (batch_size, num_sc_cells)
+
+
+class GraphContrastiveModel(pl.LightningModule):
+    """Contrastive learning model for spatial transcriptomics graphs"""
+    def __init__(
+        self, 
+        input_dim: int, 
+        hidden_dim: int = 256, 
+        latent_dim: int = 128, 
+        temperature: float = 0.1, 
+        recon_weight: float = 0.5,
+        lr: float = 1e-3
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        # GNN encoder
+        self.conv1 = GATConv(input_dim, hidden_dim, edge_dim=1)
+        self.conv2 = GATConv(hidden_dim, latent_dim, edge_dim=1)
+        
+        # Reconstruction decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+        
+        # Embedding store for similarity search
+        self.embedding_store = EmbeddingStore(metric='cosine')
+
+    def encode(self, x, edge_index, edge_attr, batch=None):
+        """Encode graph data to latent space"""
+        # First graph convolution
+        x = self.conv1(x, edge_index, edge_attr=edge_attr).relu()
+        
+        # Second graph convolution
+        x = self.conv2(x, edge_index, edge_attr=edge_attr)
+        
+        # If batch indices provided, pool to graph-level embeddings
+        if batch is not None:
+            return global_mean_pool(x, batch)
+        return x
+
+    def forward(self, data):
+        """Process a batch of graphs"""
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        return self.encode(x, edge_index, edge_attr, batch)
+
+    def _augment_graph(self, data):
+        """Apply random augmentations to graph"""
+        # Create a clone to avoid modifying original
+        data = data.clone()
+        
+        # Feature dropout (10%)
+        feature_mask = torch.rand(data.x.size()) > 0.1
+        data.x = data.x * feature_mask
+        
+        # Edge dropout (20%)
+        if data.edge_index.size(1) > 0:
+            edge_mask = torch.rand(data.edge_index.size(1)) > 0.2
+            data.edge_index = data.edge_index[:, edge_mask]
+            if data.edge_attr is not None:
+                data.edge_attr = data.edge_attr[edge_mask]
+        
+        return data
+
+    def contrastive_loss(self, z1, z2):
+        """InfoNCE loss between two views"""
+        # Normalize embeddings
+        z1 = F.normalize(z1, dim=1)
+        z2 = F.normalize(z2, dim=1)
+        
+        # Compute similarity matrix
+        logits = torch.mm(z1, z2.T) / self.hparams.temperature
+        
+        # Positive pairs are on the diagonal
+        labels = torch.arange(z1.size(0), device=self.device)
+        
+        # Compute cross entropy loss (both directions)
+        loss = F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
+        return loss / 2
+
+    def training_step(self, batch, batch_idx):
+        # Generate two augmented views
+        view1 = batch
+        view2 = self._augment_graph(batch)
+        
+        # Get embeddings
+        z1 = self(view1)
+        z2 = self(view2)
+        
+        # Contrastive loss
+        cl_loss = self.contrastive_loss(z1, z2)
+        
+        # Reconstruction loss
+        z = self(batch)
+        recon = self.decoder(z)
+        recon_loss = F.mse_loss(recon, batch.mean_expression)
+        
+        # Total loss
+        total_loss = cl_loss + self.hparams.recon_weight * recon_loss
+        
+        self.log_dict({
+            'train_loss': total_loss,
+            'contrastive_loss': cl_loss,
+            'recon_loss': recon_loss
+        })
+        return total_loss
+    
+    def validation_step(self, batch, batch_idx):
+        # Get embeddings
+        z = self(batch)
+        
+        # Reconstruction loss
+        recon = self.decoder(z)
+        recon_loss = F.mse_loss(recon, batch.mean_expression)
+        
+        self.log('val_recon_loss', recon_loss)
+        return recon_loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(
+            self.parameters(), 
+            lr=self.hparams.lr, 
+            weight_decay=1e-5
+        )
+    
+    def build_similarity_index(self, dataloader):
+        """Build similarity index from a dataloader"""
+        self.eval()
+        embeddings = []
+        labels = []
+        sample_ids = []
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                batch = batch.to(self.device)
+                z = self(batch)
+                embeddings.append(z.cpu().numpy())
+                
+                # Extract center node labels and IDs
+                if hasattr(batch, 'y'):
+                    labels.append(batch.y.cpu().numpy())
+                else:
+                    # Use dummy labels if not available
+                    labels.append(np.zeros(len(batch)))
+                    
+                if hasattr(batch, 'center_node_idx'):
+                    sample_ids.append(batch.center_node_idx.cpu().numpy())
+                else:
+                    sample_ids.append(np.arange(len(batch)))
+        
+        # Concatenate results
+        embeddings = np.concatenate(embeddings, axis=0)
+        labels = np.concatenate(labels, axis=0)
+        sample_ids = np.concatenate(sample_ids, axis=0)
+        
+        # Build index
+        self.embedding_store.build_index(embeddings, labels, sample_ids)
+        print(f"Built similarity index with {len(embeddings)} embeddings")
