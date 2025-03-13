@@ -633,11 +633,12 @@ class GraphContrastiveModel(pl.LightningModule):
         latent_dim: int = 128, 
         temperature: float = 0.1, 
         recon_weight: float = 0.5,
+        feature_drop_rate: float = 0.1,
+        edge_drop_rate: float = 0.2,
         lr: float = 1e-3
     ):
         super().__init__()
         self.save_hyperparameters()
-        
         # GNN encoder
         self.conv1 = GATConv(input_dim, hidden_dim, edge_dim=1)
         self.conv2 = GATConv(hidden_dim, latent_dim, edge_dim=1)
@@ -655,10 +656,10 @@ class GraphContrastiveModel(pl.LightningModule):
     def encode(self, x, edge_index, edge_attr, batch=None):
         """Encode graph data to latent space"""
         # First graph convolution
-        x = self.conv1(x, edge_index, edge_attr=edge_attr).relu()
+        x = self.conv1(x, edge_index).relu()
         
         # Second graph convolution
-        x = self.conv2(x, edge_index, edge_attr=edge_attr)
+        x = self.conv2(x, edge_index)
         
         # If batch indices provided, pool to graph-level embeddings
         if batch is not None:
@@ -670,23 +671,48 @@ class GraphContrastiveModel(pl.LightningModule):
         x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
         return self.encode(x, edge_index, edge_attr, batch)
 
-    def _augment_graph(self, data):
-        """Apply random augmentations to graph"""
+    # def _augment_graph(self, data):
+    #     """Apply random augmentations to graph"""
+    #     # Create a clone to avoid modifying original
+    #     data = data.clone()
+        
+    #     # Feature dropout (10%)
+    #     feature_mask = torch.rand(data.x.size()) > 0.1
+    #     data.x = data.x * feature_mask
+        
+    #     # Edge dropout (20%)
+    #     if data.edge_index.size(1) > 0:
+    #         edge_mask = torch.rand(data.edge_index.size(1)) > 0.2
+    #         data.edge_index = data.edge_index[:, edge_mask]
+    #         if data.edge_attr is not None:
+    #             data.edge_attr = data.edge_attr[edge_mask]
+        
+    #     return data
+
+    def _augment_graph(self, graph):
+        """Apply biologically plausible augmentations"""
         # Create a clone to avoid modifying original
-        data = data.clone()
+        g = graph.clone()
         
-        # Feature dropout (10%)
-        feature_mask = torch.rand(data.x.size()) > 0.1
-        data.x = data.x * feature_mask
+        # Feature permutation (row-wise shuffle)
+        # if self.hparams.permute_prob > 0 and torch.rand(1) < self.hparams.permute_prob:
+        perm = torch.randperm(g.x.size(0))  # Get random permutation of node indices
+        g.x = g.x[perm]  # Shuffle node features while keeping features intact
         
-        # Edge dropout (20%)
-        if data.edge_index.size(1) > 0:
-            edge_mask = torch.rand(data.edge_index.size(1)) > 0.2
-            data.edge_index = data.edge_index[:, edge_mask]
-            if data.edge_attr is not None:
-                data.edge_attr = data.edge_attr[edge_mask]
-        
-        return data
+        # Feature dropout
+        # if self.hparams.feature_drop_rate > 0:
+        #     drop_mask = torch.rand(g.x.size(1)) < self.hparams.feature_drop_rate
+        #     g.x[:, drop_mask] = 0
+            
+        # # Edge dropping
+        # if self.hparams.edge_drop_rate > 0 and g.edge_index.size(1) > 0:
+        #     num_edges = g.edge_index.size(1)
+        #     keep_mask = torch.rand(num_edges) > self.hparams.edge_drop_rate
+        #     g.edge_index = g.edge_index[:, keep_mask]
+        #     if g.edge_attr is not None:
+        #         g.edge_attr = g.edge_attr[keep_mask]
+            
+        return g
 
     def contrastive_loss(self, z1, z2):
         """InfoNCE loss between two views"""
