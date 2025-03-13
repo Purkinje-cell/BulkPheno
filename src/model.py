@@ -156,14 +156,12 @@ class EmbeddingStore:
 
 
 class TripletLoss(nn.Module):
-    """Online hard triplet mining with PyTorch's TripletMarginLoss"""
-
-    def __init__(self, margin=1.0, distance="euclidean"):
+    """Triplet loss with hard mining using L2 distance"""
+    def __init__(self, margin=1.0):
         super().__init__()
         self.margin = margin
-        self.distance = distance
         self.loss_fn = nn.TripletMarginLoss(margin=margin, p=2)
-
+        
     def forward(self, embeddings, labels):
         """Compute loss using hardest triplets in batch"""
         triplets = self._get_triplets(embeddings, labels)
@@ -171,18 +169,15 @@ class TripletLoss(nn.Module):
             return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
         return self.loss_fn(*triplets)
         
-    def cosine_similarity(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return F.cosine_similarity(a, b, dim=-1)
-    
-    def euclidean_distance(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return F.pairwise_distance(a, b, p=2)
+    def pairwise_distance(self, x, y=None):
+        """Compute pairwise L2 distance between tensors"""
+        if y is None:
+            y = x
+        return torch.cdist(x, y, p=2)
 
     def _get_triplets(self, embeddings, labels):
-        # Update distance calculation to use cosine similarity
-        pairwise_dist = 1 - self.cosine_similarity(
-            embeddings.unsqueeze(1),
-            embeddings.unsqueeze(0)
-        )
+        # Use L2 distance for mining
+        pairwise_dist = self.pairwise_distance(embeddings)
 
         labels = labels.view(-1, 1)
         mask_same = labels == labels.t()
@@ -631,7 +626,7 @@ class GraphContrastiveModel(pl.LightningModule):
         input_dim: int, 
         hidden_dim: int = 256, 
         latent_dim: int = 128, 
-        temperature: float = 0.1, 
+        margin: float = 1.0,
         recon_weight: float = 0.5,
         feature_drop_rate: float = 0.1,
         edge_drop_rate: float = 0.2,
@@ -649,6 +644,9 @@ class GraphContrastiveModel(pl.LightningModule):
             nn.ReLU(),
             nn.Linear(hidden_dim, input_dim)
         )
+        
+        # Triplet loss with hard mining
+        self.triplet_loss = TripletLoss(margin=margin)
         
         # Embedding store for similarity search
         self.embedding_store = EmbeddingStore(metric='cosine')
@@ -671,46 +669,29 @@ class GraphContrastiveModel(pl.LightningModule):
         x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
         return self.encode(x, edge_index, edge_attr, batch)
 
-    # def _augment_graph(self, data):
-    #     """Apply random augmentations to graph"""
-    #     # Create a clone to avoid modifying original
-    #     data = data.clone()
-        
-    #     # Feature dropout (10%)
-    #     feature_mask = torch.rand(data.x.size()) > 0.1
-    #     data.x = data.x * feature_mask
-        
-    #     # Edge dropout (20%)
-    #     if data.edge_index.size(1) > 0:
-    #         edge_mask = torch.rand(data.edge_index.size(1)) > 0.2
-    #         data.edge_index = data.edge_index[:, edge_mask]
-    #         if data.edge_attr is not None:
-    #             data.edge_attr = data.edge_attr[edge_mask]
-        
-    #     return data
-
     def _augment_graph(self, graph):
-        """Apply biologically plausible augmentations"""
-        # Create a clone to avoid modifying original
+        """Augmentation preserving center node ID"""
         g = graph.clone()
         
-        # Feature permutation (row-wise shuffle)
-        # if self.hparams.feature_drop_rate > 0 and torch.rand(1) < 0.5:
-        perm = torch.randperm(g.x.size(0))  # Get random permutation of node indices
-        g.x = g.x[perm]  # Shuffle node features while keeping features intact
+        # Feature permutation (preserve center node)
+        if torch.rand(1) < 0.5:
+            perm = torch.randperm(g.x.size(0))
+            # Keep center node in first position
+            if 0 in perm:  # Assuming center node is at index 0
+                perm[perm == 0] = perm[0]
+                perm[0] = 0
+            g.x = g.x[perm]
         
-        # # Feature dropout
-        # if self.hparams.feature_drop_rate > 0:
-        #     drop_mask = torch.rand(g.x.size(1)) < self.hparams.feature_drop_rate
-        #     g.x[:, drop_mask] = 0
+        # Feature dropout
+        drop_mask = torch.rand_like(g.x) < self.hparams.feature_drop_rate
+        g.x[drop_mask] = 0
             
-        # # Edge dropping
-        # if self.hparams.edge_drop_rate > 0 and g.edge_index.size(1) > 0:
-        #     num_edges = g.edge_index.size(1)
-        #     keep_mask = torch.rand(num_edges) > self.hparams.edge_drop_rate
-        #     g.edge_index = g.edge_index[:, keep_mask]
-        #     if g.edge_attr is not None:
-        #         g.edge_attr = g.edge_attr[keep_mask]
+        # Edge dropping
+        if g.edge_index.size(1) > 0:
+            keep_mask = torch.rand(g.edge_index.size(1)) > self.hparams.edge_drop_rate
+            g.edge_index = g.edge_index[:, keep_mask]
+            if g.edge_attr is not None:
+                g.edge_attr = g.edge_attr[keep_mask]
             
         return g
         
@@ -720,60 +701,113 @@ class GraphContrastiveModel(pl.LightningModule):
             return Batch.from_data_list([self._augment_graph(g) for g in batch.to_data_list()])
         return self._augment_graph(batch)
 
-    def contrastive_loss(self, z1, z2):
-        """InfoNCE loss between two views"""
-        # Normalize embeddings
-        z1 = F.normalize(z1, dim=1)
-        z2 = F.normalize(z2, dim=1)
+    def _get_hard_triplets(self, embeddings, center_nodes):
+        """Mine hard triplets based on center node identity using L2 distance"""
+        pairwise_dist = torch.cdist(embeddings, embeddings, p=2)
         
-        # Compute similarity matrix
-        logits = torch.mm(z1, z2.T) / self.hparams.temperature
+        triplets = []
+        for i in range(len(embeddings)):
+            # Positive: same center node (original + augmented)
+            pos_mask = (center_nodes == center_nodes[i])
+            pos_mask[i] = False  # Exclude self
+            
+            if not pos_mask.any():
+                continue
+                
+            # Hardest positive (furthest)
+            hardest_pos = torch.argmax(pairwise_dist[i][pos_mask]).item()
+            pos_idx = torch.where(pos_mask)[0][hardest_pos].item()
+            
+            # Negative: different center node
+            neg_mask = (center_nodes != center_nodes[i])
+            if not neg_mask.any():
+                continue
+                
+            # Hardest negative (closest)
+            hardest_neg = torch.argmin(pairwise_dist[i][neg_mask]).item()
+            neg_idx = torch.where(neg_mask)[0][hardest_neg].item()
+            
+            triplets.append((i, pos_idx, neg_idx))
         
-        # Positive pairs are on the diagonal
-        labels = torch.arange(z1.size(0), device=self.device)
-        
-        # Compute cross entropy loss (both directions)
-        loss = F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
-        return loss / 2
+        if not triplets:
+            return None
+            
+        indices = torch.tensor(triplets, device=embeddings.device)
+        return (
+            embeddings[indices[:, 0]],
+            embeddings[indices[:, 1]],
+            embeddings[indices[:, 2]],
+        )
 
     def training_step(self, batch, batch_idx):
-        # Generate two augmented views
-        view1 = self._augment_batch(batch)
-        view2 = self._augment_batch(batch)
+        # Generate augmented view
+        augmented_batch = self._augment_batch(batch)
         
-        # Get embeddings
-        z1 = self(view1)
-        z2 = self(view2)
+        # Get embeddings for both original and augmented
+        z_orig = self(batch)
+        z_aug = self(augmented_batch)
         
-        # Contrastive loss
-        cl_loss = self.contrastive_loss(z1, z2)
+        # Combine embeddings and center nodes
+        combined_z = torch.cat([z_orig, z_aug], dim=0)
+        combined_centers = torch.cat([batch.center_node_idx, batch.center_node_idx], dim=0)
+        
+        # Mine hard triplets
+        triplets = self._get_hard_triplets(combined_z, combined_centers)
+        
+        # Calculate triplet loss
+        if triplets is None:
+            cl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        else:
+            cl_loss = self.triplet_loss(*triplets)
         
         # Reconstruction loss
-        recon = self.decoder(z1)
-        recon = recon.reshape(-1)
+        recon = self.decoder(z_orig)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
         
         # Total loss
         total_loss = cl_loss + self.hparams.recon_weight * recon_loss
-        # total_loss = cl_loss
         
         self.log_dict({
             'train_loss': total_loss,
-            'contrastive_loss': cl_loss,
+            'triplet_loss': cl_loss,
             'recon_loss': recon_loss
         })
         return total_loss
     
     def validation_step(self, batch, batch_idx):
-        # Get embeddings
-        z = self(batch)
+        # Generate augmented view
+        augmented_batch = self._augment_batch(batch)
+        
+        # Get embeddings for both original and augmented
+        z_orig = self(batch)
+        z_aug = self(augmented_batch)
+        
+        # Combine embeddings and center nodes
+        combined_z = torch.cat([z_orig, z_aug], dim=0)
+        combined_centers = torch.cat([batch.center_node_idx, batch.center_node_idx], dim=0)
+        
+        # Mine hard triplets
+        triplets = self._get_hard_triplets(combined_z, combined_centers)
+        
+        # Calculate triplet loss
+        if triplets is None:
+            cl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        else:
+            cl_loss = self.triplet_loss(*triplets)
         
         # Reconstruction loss
-        recon = self.decoder(z)
+        recon = self.decoder(z_orig)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
         
-        self.log('val_recon_loss', recon_loss)
-        return recon_loss
+        # Total loss
+        total_loss = cl_loss + self.hparams.recon_weight * recon_loss
+        
+        self.log_dict({
+            'val_loss': total_loss,
+            'val_triplet_loss': cl_loss,
+            'val_recon_loss': recon_loss
+        })
+        return total_loss
 
     def configure_optimizers(self):
         return torch.optim.Adam(
