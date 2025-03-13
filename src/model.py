@@ -1,5 +1,5 @@
 import collections
-from typing import Callable, Iterable, Literal, Union
+from typing import Callable, Iterable, Literal, Union, List, Dict, Any
 
 
 import anndata as ad
@@ -46,7 +46,7 @@ from torch.distributions import Categorical, Distribution, Normal
 from torch.distributions import kl_divergence
 from torch.distributions import kl_divergence as kl
 from torch.nn.functional import one_hot
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 from torch_geometric.nn import (
     GATConv,
     GCNConv,
@@ -695,24 +695,30 @@ class GraphContrastiveModel(pl.LightningModule):
         g = graph.clone()
         
         # Feature permutation (row-wise shuffle)
-        # if self.hparams.permute_prob > 0 and torch.rand(1) < self.hparams.permute_prob:
-        perm = torch.randperm(g.x.size(0))  # Get random permutation of node indices
-        g.x = g.x[perm]  # Shuffle node features while keeping features intact
+        if self.hparams.feature_drop_rate > 0 and torch.rand(1) < 0.5:
+            perm = torch.randperm(g.x.size(0))  # Get random permutation of node indices
+            g.x = g.x[perm]  # Shuffle node features while keeping features intact
         
         # Feature dropout
-        # if self.hparams.feature_drop_rate > 0:
-        #     drop_mask = torch.rand(g.x.size(1)) < self.hparams.feature_drop_rate
-        #     g.x[:, drop_mask] = 0
+        if self.hparams.feature_drop_rate > 0:
+            drop_mask = torch.rand(g.x.size(1)) < self.hparams.feature_drop_rate
+            g.x[:, drop_mask] = 0
             
-        # # Edge dropping
-        # if self.hparams.edge_drop_rate > 0 and g.edge_index.size(1) > 0:
-        #     num_edges = g.edge_index.size(1)
-        #     keep_mask = torch.rand(num_edges) > self.hparams.edge_drop_rate
-        #     g.edge_index = g.edge_index[:, keep_mask]
-        #     if g.edge_attr is not None:
-        #         g.edge_attr = g.edge_attr[keep_mask]
+        # Edge dropping
+        if self.hparams.edge_drop_rate > 0 and g.edge_index.size(1) > 0:
+            num_edges = g.edge_index.size(1)
+            keep_mask = torch.rand(num_edges) > self.hparams.edge_drop_rate
+            g.edge_index = g.edge_index[:, keep_mask]
+            if g.edge_attr is not None:
+                g.edge_attr = g.edge_attr[keep_mask]
             
         return g
+        
+    def _augment_batch(self, batch):
+        """Apply augmentations to entire batch"""
+        if isinstance(batch, Batch):
+            return Batch.from_data_list([self._augment_graph(g) for g in batch.to_data_list()])
+        return self._augment_graph(batch)
 
     def contrastive_loss(self, z1, z2):
         """InfoNCE loss between two views"""
@@ -732,8 +738,8 @@ class GraphContrastiveModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # Generate two augmented views
-        view1 = batch
-        view2 = self._augment_graph(batch)
+        view1 = self._augment_batch(batch)
+        view2 = self._augment_batch(batch)
         
         # Get embeddings
         z1 = self(view1)
@@ -743,8 +749,7 @@ class GraphContrastiveModel(pl.LightningModule):
         cl_loss = self.contrastive_loss(z1, z2)
         
         # Reconstruction loss
-        z = self(batch)
-        recon = self.decoder(z)
+        recon = self.decoder(z1)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
         
         # Total loss

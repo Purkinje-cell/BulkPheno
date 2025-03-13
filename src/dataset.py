@@ -4,9 +4,9 @@ import numpy as np
 import scanpy as sc
 import anndata as ad
 import pytorch_lightning as pl
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from sklearn.model_selection import train_test_split
-from torch_geometric.data import Data, InMemoryDataset
+from torch_geometric.data import Data, InMemoryDataset, Batch
 from torch_geometric.loader import DataLoader as PyGLoader
 from torch_geometric.utils import k_hop_subgraph, from_scipy_sparse_matrix
 
@@ -296,12 +296,13 @@ class SpatialGraphDataset(InMemoryDataset):
 class GraphContrastiveDataModule(pl.LightningDataModule):
     """DataModule for spatial graph contrastive learning"""
 
-    def __init__(self, adata, hops=2, batch_size=64, num_workers=4):
+    def __init__(self, adata, hops=2, batch_size=64, num_workers=4, val_split=0.2):
         super().__init__()
         self.adata = adata
         self.hops = hops
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.val_split = val_split
         self.dataset = None
 
     def prepare_data(self):
@@ -312,20 +313,27 @@ class GraphContrastiveDataModule(pl.LightningDataModule):
         if self.dataset is None:
             self.prepare_data()
 
-        # 90-10 train-val split
-        train_size = int(0.9 * len(self.dataset))
-        self.train_data = self.dataset[:train_size]
-        self.val_data = self.dataset[train_size:]
+        # Create train/val splits with random permutation
+        indices = np.random.permutation(len(self.dataset))
+        train_size = int((1 - self.val_split) * len(indices))
+        self.train_idx = indices[:train_size]
+        self.val_idx = indices[train_size:]
 
     def train_dataloader(self):
+        from torch.utils.data import Subset
         return PyGLoader(
-            self.train_data,
+            Subset(self.dataset, self.train_idx),
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
+            follow_batch=['x', 'mean_expression'],
         )
 
     def val_dataloader(self):
+        from torch.utils.data import Subset
         return PyGLoader(
-            self.val_data, batch_size=self.batch_size, num_workers=self.num_workers
+            Subset(self.dataset, self.val_idx),
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            follow_batch=['x', 'mean_expression'],
         )
