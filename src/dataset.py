@@ -290,7 +290,7 @@ class SpatialGraphDataset(InMemoryDataset):
 class GraphContrastiveDataModule(pl.LightningDataModule):
     """DataModule for spatial graph contrastive learning"""
     def __init__(self, adata, hops=2, batch_size=64, num_workers=4,
-                 feature_drop_rate=0.1, edge_drop_rate=0.2):
+                 feature_drop_rate=0.1, edge_drop_rate=0.2, permute_prob=0.2):
         super().__init__()
         self.adata = adata
         self.hops = hops
@@ -298,6 +298,7 @@ class GraphContrastiveDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.feature_drop_rate = feature_drop_rate
         self.edge_drop_rate = edge_drop_rate
+        self.permute_prob = permute_prob  # Add new parameter
         self.dataset = None
 
     def prepare_data(self):
@@ -317,6 +318,11 @@ class GraphContrastiveDataModule(pl.LightningDataModule):
         """Apply biologically plausible augmentations"""
         # Create a clone to avoid modifying original
         g = graph.clone()
+        
+        # Feature permutation (row-wise shuffle)
+        if self.permute_prob > 0 and torch.rand(1) < self.permute_prob:
+            perm = torch.randperm(g.x.size(0))  # Get random permutation of node indices
+            g.x = g.x[perm]  # Shuffle node features while keeping features intact
         
         # Feature dropout
         if self.feature_drop_rate > 0:
