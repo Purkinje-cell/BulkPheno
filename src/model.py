@@ -62,7 +62,7 @@ from torch_scatter import scatter_add
 # from module import BulkVAEModule
 # from training_mixin import BasicTrainingMixin
 # from utils import broadcast_labels, one_hot
-from dataset import ContrastiveBulkDataset
+from dataset import ContrastiveBulkDataset, BulkDataset
 
 
 class FullCrossAttention(nn.Module):
