@@ -628,6 +628,115 @@ class PhenotypeAttentionModel(pl.LightningModule):
         return attn_weights.squeeze(1)  # (batch_size, num_sc_cells)
 
 
+class BulkEncoderModel(pl.LightningModule):
+    """Bulk RNA encoder aligned with GCL model's latent space"""
+    def __init__(
+        self,
+        input_dim: int,
+        gcl_model: 'GraphContrastiveModel',
+        latent_dim: int = 128,
+        hidden_dims: list = [512, 256],
+        recon_weight: float = 1.0,
+        align_weight: float = 0.5,
+        lr: float = 1e-3,
+        dropout: float = 0.2
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=['gcl_model'])
+        
+        # Encoder network
+        self.encoder = Encoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            hidden_dims=hidden_dims,
+            dropout=dropout
+        )
+        
+        # Initialize decoder from GCL model and freeze
+        self.decoder = gcl_model.decoder
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+            
+        # Store reference to GCL model
+        self.gcl_model = gcl_model
+        self.gcl_model.eval()
+        for param in self.gcl_model.parameters():
+            param.requires_grad = False
+            
+        # Loss components
+        self.recon_loss = nn.MSELoss()
+        self.align_loss = nn.MSELoss()
+
+    def forward(self, x):
+        z = self.encoder(x)
+        recon = self.decoder(z)
+        return z, recon
+
+    def training_step(self, batch, batch_idx):
+        if batch['is_real']:
+            return self._real_batch_step(batch)
+        else:
+            return self._pseudo_batch_step(batch)
+
+    def _real_batch_step(self, batch):
+        x = batch['expression']
+        z, recon = self(x)
+        loss = self.recon_loss(recon, x) * self.hparams.recon_weight
+        self.log("train_real_loss", loss)
+        return loss
+
+    def _pseudo_batch_step(self, batch):
+        x = batch['expression']
+        graph_indices = batch['graph_indices']
+        
+        # Get bulk embeddings
+        z_bulk, recon = self(x)
+        
+        # Get corresponding GCL embeddings
+        with torch.no_grad():
+            graphs = [self.gcl_model.dataset[idx] for idx in graph_indices]
+            batch = Batch.from_data_list(graphs).to(self.device)
+            z_gcl = self.gcl_model.encode(
+                batch.x, 
+                batch.edge_index, 
+                batch.edge_attr,
+                batch.batch
+            )
+        
+        # Calculate losses
+        recon_loss = self.recon_loss(recon, x) * self.hparams.recon_weight
+        align_loss = self.align_loss(z_bulk, z_gcl) * self.hparams.align_weight
+        total_loss = recon_loss + align_loss
+        
+        self.log_dict({
+            "train_pseudo_recon_loss": recon_loss,
+            "train_align_loss": align_loss,
+            "train_pseudo_total_loss": total_loss
+        })
+        return total_loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(
+            self.encoder.parameters(), 
+            lr=self.hparams.lr,
+            weight_decay=1e-5
+        )
+
+    def get_latent_embedding(self, adata: ad.AnnData):
+        """Get latent embeddings for bulk RNA data"""
+        self.eval()
+        dataset = BulkDataset(adata=adata)
+        loader = DataLoader(dataset, batch_size=256, shuffle=False)
+        
+        embeddings = []
+        with torch.no_grad():
+            for batch in loader:
+                x = batch['expression'].to(self.device)
+                z, _ = self(x)
+                embeddings.append(z.cpu())
+                
+        return torch.cat(embeddings, dim=0).numpy()
+
 class GraphContrastiveModel(pl.LightningModule):
     """Contrastive learning model for spatial transcriptomics graphs"""
     def __init__(
