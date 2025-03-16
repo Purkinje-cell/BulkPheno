@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 from torch_geometric.data import Data, InMemoryDataset, Batch
 from torch_geometric.loader import DataLoader as PyGLoader
 from torch_geometric.utils import k_hop_subgraph, from_scipy_sparse_matrix
+from tqdm import tqdm
 
 # TripletSelector class removed as we now use online hard mining
 
@@ -238,7 +239,7 @@ class PhenotypeDataModule(pl.LightningDataModule):
 class SpatialGraphDataset(InMemoryDataset):
     """Dataset for spatial transcriptomics data represented as graphs"""
 
-    def __init__(self, adata, hops=2, transform=None):
+    def __init__(self, adata, name, hops=2, transform=None):
         """
         Args:
             adata: AnnData object with spatial information
@@ -246,20 +247,21 @@ class SpatialGraphDataset(InMemoryDataset):
             transform: PyG transforms to apply
         """
         self.adata = adata
+        self.name = name
         self.hops = hops
         super().__init__(transform=transform)
         self.data, self.slices = torch.load(self.processed_paths[0])
 
     @property
     def processed_file_names(self):
-        return ["spatial_graph_data.pt"]
+        return [f"../processed/spatial_graph_data_{self.name}.pt"]
 
     def process(self):
         graphs = []
         edge_index, edge_attr = from_scipy_sparse_matrix(
             self.adata.obsp["spatial_connectivities"]
         )
-        for node_idx in range(self.adata.shape[0]):
+        for node_idx in tqdm(range(self.adata.shape[0])):
             # Extract k-hop subgraph with edge attributes
             subset, edge_index_sub, _, edge_mask = k_hop_subgraph(
                 node_idx, self.hops, edge_index, num_nodes=self.adata.shape[0], relabel_nodes=True

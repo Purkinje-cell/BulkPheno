@@ -212,6 +212,15 @@ class TripletLoss(nn.Module):
             embeddings[indices[:, 2]],
         )
 
+class TripletGCLLoss(nn.Module):
+    """Triplet loss with hard mining using L2 distance"""
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
+        self.loss_fn = nn.TripletMarginLoss(margin=margin, p=2)
+        
+    def forward(self, anchor, positive, negative):
+        return self.loss_fn(anchor, positive, negative)
 
 # class BulkVAE(UnsupervisedTrainingMixin, VAEMixin, BaseModelClass):
 #     def __init__(
@@ -646,7 +655,7 @@ class GraphContrastiveModel(pl.LightningModule):
         )
         
         # Triplet loss with hard mining
-        self.triplet_loss = TripletLoss(margin=margin)
+        self.triplet_loss = TripletGCLLoss(margin=margin)
         
         # Embedding store for similarity search
         self.embedding_store = EmbeddingStore(metric='cosine')
@@ -654,10 +663,10 @@ class GraphContrastiveModel(pl.LightningModule):
     def encode(self, x, edge_index, edge_attr, batch=None):
         """Encode graph data to latent space"""
         # First graph convolution
-        x = self.conv1(x, edge_index).relu()
+        x = self.conv1(x, edge_index, edge_attr=edge_attr).relu()
         
         # Second graph convolution
-        x = self.conv2(x, edge_index)
+        x = self.conv2(x, edge_index, edge_attr=edge_attr)
         
         # If batch indices provided, pool to graph-level embeddings
         if batch is not None:
@@ -674,24 +683,21 @@ class GraphContrastiveModel(pl.LightningModule):
         g = graph.clone()
         
         # Feature permutation (preserve center node)
-        if torch.rand(1) < 0.5:
-            perm = torch.randperm(g.x.size(0))
-            # Keep center node in first position
-            if 0 in perm:  # Assuming center node is at index 0
-                perm[perm == 0] = perm[0]
-                perm[0] = 0
-            g.x = g.x[perm]
+        # if torch.rand(1) < 0.5:
+        perm = torch.randperm(g.x.size(0))
+        # Keep center node in first position
+        g.x = g.x[perm]
         
-        # Feature dropout
-        drop_mask = torch.rand_like(g.x) < self.hparams.feature_drop_rate
-        g.x[drop_mask] = 0
+        # # Feature dropout
+        # drop_mask = torch.rand_like(g.x) < self.hparams.feature_drop_rate
+        # g.x[drop_mask] = 0
             
-        # Edge dropping
-        if g.edge_index.size(1) > 0:
-            keep_mask = torch.rand(g.edge_index.size(1)) > self.hparams.edge_drop_rate
-            g.edge_index = g.edge_index[:, keep_mask]
-            if g.edge_attr is not None:
-                g.edge_attr = g.edge_attr[keep_mask]
+        # # Edge dropping
+        # if g.edge_index.size(1) > 0:
+        #     keep_mask = torch.rand(g.edge_index.size(1)) > self.hparams.edge_drop_rate
+        #     g.edge_index = g.edge_index[:, keep_mask]
+        #     if g.edge_attr is not None:
+        #         g.edge_attr = g.edge_attr[keep_mask]
             
         return g
         
@@ -762,6 +768,7 @@ class GraphContrastiveModel(pl.LightningModule):
         
         # Reconstruction loss
         recon = self.decoder(z_orig)
+        recon = recon.reshape(-1)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
         
         # Total loss
@@ -830,7 +837,7 @@ class GraphContrastiveModel(pl.LightningModule):
                 embeddings.append(z.cpu().numpy())
                 
                 # Extract center node labels and IDs
-                if hasattr(batch, 'y'):
+                if batch.y is not None:
                     labels.append(batch.y.cpu().numpy())
                 else:
                     # Use dummy labels if not available
