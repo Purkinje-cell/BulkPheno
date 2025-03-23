@@ -20,26 +20,6 @@ except ImportError:
 from torch.utils.data import DataLoader, Dataset
 from anndata import AnnData
 from networkx import subgraph
-from scvi import REGISTRY_KEYS
-from scvi.module._constants import MODULE_KEYS
-from scvi.data import AnnDataManager
-from scvi.data.fields import (
-    CategoricalJointObsField,
-    CategoricalObsField,
-    LayerField,
-    NumericalJointObsField,
-    NumericalObsField,
-)
-from scvi.distributions import NegativeBinomial, Normal, ZeroInflatedNegativeBinomial
-from scvi.model.base import (
-    BaseModelClass,
-    UnsupervisedTrainingMixin,
-    VAEMixin,
-    EmbeddingMixin,
-    ArchesMixin,
-)
-from scvi.module import VAE
-from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import Decoder, DecoderSCVI, Embedding, Encoder, FCLayers
 from scvi.utils import setup_anndata_dsp
 from torch.distributions import Categorical, Distribution, Normal
@@ -49,6 +29,7 @@ from torch.nn.functional import one_hot
 from torch_geometric.data import Data, Batch
 from torch_geometric.nn import (
     GATConv,
+    Sequential,
     GCNConv,
     GINConv,
     PNAConv,
@@ -59,9 +40,6 @@ from torch_geometric.nn import (
 from torch_geometric.utils import to_dense_adj, to_scipy_sparse_matrix
 from torch_scatter import scatter_add
 
-# from module import BulkVAEModule
-# from training_mixin import BasicTrainingMixin
-# from utils import broadcast_labels, one_hot
 from dataset import ContrastiveBulkDataset, BulkDataset
 
 
@@ -146,7 +124,7 @@ class EmbeddingStore:
             distances, indices = self.index.search(query_embedding, k)
         else:
             distances, indices = self.index.kneighbors(query_embedding, n_neighbors=k)
-            
+        
         return {
             'indices': indices,
             'distances': distances,
@@ -577,9 +555,14 @@ class PhenotypeAttentionModel(pl.LightningModule):
         """
         # Load encoder weights
         self.bulk_encoder.load_state_dict(contrastive_ae.encoder.state_dict())
+        for param in self.bulk_encoder.parameters():
+            param.requires_grad = False
         
         # Load decoder weights
         self.decoder.load_state_dict(contrastive_ae.decoder.state_dict())
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+            
         
         print("Successfully loaded pretrained encoder and decoder weights")
 
@@ -591,7 +574,7 @@ class PhenotypeAttentionModel(pl.LightningModule):
 
     def setup_sc_embeddings(self, sc_embeddings: torch.Tensor):
         """Register single-cell embeddings as buffer"""
-        self.register_buffer('sc_embeddings', sc_embeddings)
+        self.sc_embeddings = sc_embeddings
 
     def training_step(self, batch, batch_idx):
         bulk_x, phenotype_labels = batch
@@ -605,7 +588,7 @@ class PhenotypeAttentionModel(pl.LightningModule):
         # Triplet loss on phenotype labels
         triplet_loss = self.triplet_loss(attended_z, phenotype_labels)
         
-        total_loss = self.hparams.recon_weight * recon_loss + triplet_loss
+        total_loss = self.hparams.recon_weight * recon_loss
         
         self.log_dict({
             "train_loss": total_loss,
@@ -623,6 +606,7 @@ class PhenotypeAttentionModel(pl.LightningModule):
 
     def get_attention_weights(self, bulk_x):
         """Retrieve attention weights for interpretation"""
+        self.eval()
         with torch.no_grad():
             _, _, attn_weights = self(bulk_x)
         return attn_weights.squeeze(1)  # (batch_size, num_sc_cells)
@@ -658,9 +642,9 @@ class BulkEncoderModel(pl.LightningModule):
             param.requires_grad = False
             
         # Store reference to GCL model
-        self.gcl_model = gcl_model
-        self.gcl_model.eval()
-        for param in self.gcl_model.parameters():
+        self.gcl_encoder = gcl_model
+        self.gcl_encoder.eval()
+        for param in self.gcl_encoder.parameters():
             param.requires_grad = False
             
         # Loss components
@@ -677,6 +661,15 @@ class BulkEncoderModel(pl.LightningModule):
             return self._real_batch_step(batch)
         else:
             return self._pseudo_batch_step(batch)
+    
+    def validation_step(self, batch, batch_idx):
+        if batch['is_real']:
+            return self._real_batch_step(batch)
+        else:
+            return self._pseudo_batch_step(batch)
+    
+    def set_graph_dataset(self, dataset):
+        self.gcl_encoder.dataset = dataset
 
     def _real_batch_step(self, batch):
         x = batch['expression']
@@ -694,9 +687,9 @@ class BulkEncoderModel(pl.LightningModule):
         
         # Get corresponding GCL embeddings
         with torch.no_grad():
-            graphs = [self.gcl_model.dataset[idx] for idx in graph_indices]
+            graphs = [self.gcl_encoder.dataset[idx] for idx in graph_indices]
             batch = Batch.from_data_list(graphs).to(self.device)
-            z_gcl = self.gcl_model.encode(
+            z_gcl = self.gcl_encoder.encode(
                 batch.x, 
                 batch.edge_index, 
                 batch.edge_attr,
@@ -754,7 +747,17 @@ class GraphContrastiveModel(pl.LightningModule):
         self.save_hyperparameters()
         # GNN encoder
         self.conv1 = GATConv(input_dim, hidden_dim, edge_dim=1)
-        self.conv2 = GATConv(hidden_dim, latent_dim, edge_dim=1)
+        self.conv2 = GATConv(hidden_dim, hidden_dim, edge_dim=1)
+        self.projector = nn.Linear(hidden_dim, latent_dim)
+        self.encoder = Sequential('x, edge_index, edge_attr, batch', [
+            (nn.Dropout(p=self.hparams.feature_drop_rate), 'x -> x'),
+            (self.conv1, 'x, edge_index, edge_attr -> x'),
+            (nn.ReLU(), 'x -> x'),
+            (self.conv2, 'x, edge_index, edge_attr -> x'),
+            (nn.ReLU(), 'x -> x'),
+            (self.projector, 'x -> x'),
+            (global_mean_pool, 'x, batch -> x')
+        ])
         
         # Reconstruction decoder
         self.decoder = nn.Sequential(
@@ -772,14 +775,7 @@ class GraphContrastiveModel(pl.LightningModule):
     def encode(self, x, edge_index, edge_attr, batch=None):
         """Encode graph data to latent space"""
         # First graph convolution
-        x = self.conv1(x, edge_index, edge_attr=edge_attr).relu()
-        
-        # Second graph convolution
-        x = self.conv2(x, edge_index, edge_attr=edge_attr)
-        
-        # If batch indices provided, pool to graph-level embeddings
-        if batch is not None:
-            return global_mean_pool(x, batch)
+        x = self.encoder(x, edge_index, edge_attr, batch)
         return x
 
     def forward(self, data):
@@ -884,9 +880,9 @@ class GraphContrastiveModel(pl.LightningModule):
         total_loss = cl_loss + self.hparams.recon_weight * recon_loss
         
         self.log_dict({
-            'train_loss': total_loss,
-            'triplet_loss': cl_loss,
-            'recon_loss': recon_loss
+            'train_total_loss': total_loss,
+            'train_triplet_loss': cl_loss,
+            'train_recon_loss': recon_loss
         })
         return total_loss
     

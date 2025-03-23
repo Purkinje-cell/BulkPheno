@@ -366,7 +366,7 @@ class BulkDataModule(pl.LightningDataModule):
         if self.spatial_adata is not None:
             self.spatial_graph_dataset = SpatialGraphDataset(
                 self.spatial_adata, 
-                name="pseudo_bulk",
+                name="pseudo_bulk_2c",
                 hops=self.spatial_hops
             )
 
@@ -375,6 +375,9 @@ class BulkDataModule(pl.LightningDataModule):
             indices = np.arange(self.bulk_adata.shape[0])
             train_idx, test_idx = train_test_split(indices, test_size=self.test_split)
             train_idx, val_idx = train_test_split(train_idx, test_size=self.val_split)
+            self.train_idx = train_idx
+            self.val_idx = val_idx
+            self.test_idx = test_idx
             
             self.real_train = BulkDataset(adata=self.bulk_adata[train_idx])
             self.real_val = BulkDataset(adata=self.bulk_adata[val_idx])
@@ -382,51 +385,37 @@ class BulkDataModule(pl.LightningDataModule):
 
         if self.spatial_graph_dataset is not None:
             indices = np.arange(len(self.spatial_graph_dataset))
-            train_idx, test_idx = train_test_split(indices, test_size=self.test_split)
-            train_idx, val_idx = train_test_split(train_idx, test_size=self.val_split)
+            train_idx, test_idx = train_test_split(indices, test_size=self.test_split, random_state=42)
+            train_idx, val_idx = train_test_split(train_idx, test_size=self.val_split, random_state=42)
+            self.train_idx = train_idx
+            self.val_idx = val_idx
+            self.test_idx = test_idx
             
             self.pseudo_train = BulkDataset(spatial_graph_dataset=Subset(self.spatial_graph_dataset, train_idx))
             self.pseudo_val = BulkDataset(spatial_graph_dataset=Subset(self.spatial_graph_dataset, val_idx))
             self.pseudo_test = BulkDataset(spatial_graph_dataset=Subset(self.spatial_graph_dataset, test_idx))
 
     def train_dataloader(self):
-        loaders = {}
         if hasattr(self, 'real_train'):
-            loaders['real'] = DataLoader(
+            real_loader = DataLoader(
                 self.real_train,
                 batch_size=self.batch_size,
                 shuffle=True,
                 num_workers=self.num_workers,
                 collate_fn=self._collate_fn
             )
+            return real_loader
+
         if hasattr(self, 'pseudo_train'):
-            loaders['pseudo'] = DataLoader(
+            pseudo_loader = DataLoader(
                 self.pseudo_train,
                 batch_size=self.batch_size,
                 shuffle=True,
                 num_workers=self.num_workers,
                 collate_fn=self._collate_fn
             )
-        return CombinedLoader(loaders, mode="max_size_cycle")
+            return pseudo_loader
         
-    def val_dataloader(self):
-        loaders = {}
-        if hasattr(self, 'real_val'):
-            loaders['real'] = DataLoader(
-                self.real_val,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers,
-                collate_fn=self._collate_fn
-            )
-        if hasattr(self, 'pseudo_val'):
-            loaders['pseudo'] = DataLoader(
-                self.pseudo_val,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers,
-                collate_fn=self._collate_fn
-            )
-        return CombinedLoader(loaders, mode="max_size_cycle")
-
     def _collate_fn(self, batch):
         """Custom collate to handle mixed real/pseudo batches"""
         is_real = batch[0]['is_real']
