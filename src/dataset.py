@@ -238,9 +238,17 @@ class PhenotypeDataModule(pl.LightningDataModule):
 
 
 class SpatialGraphDataset(InMemoryDataset):
-    """Dataset for spatial transcriptomics data represented as graphs"""
+    """
+    Dataset for spatial transcriptomics data represented as graphs
+    """
 
-    def __init__(self, adata, name, hops=2, transform=None):
+    def __init__(
+        self, 
+        adata: ad.AnnData, 
+        name: str, 
+        batch_key=None, 
+        hops=2, 
+        transform=None):
         """
         Args:
             adata: AnnData object with spatial information
@@ -250,8 +258,9 @@ class SpatialGraphDataset(InMemoryDataset):
         self.adata = adata
         self.name = name
         self.hops = hops
+        self.batch_key = batch_key
         super().__init__(transform=transform)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
 
     @property
     def processed_file_names(self):
@@ -260,12 +269,20 @@ class SpatialGraphDataset(InMemoryDataset):
     def process(self):
         graphs = []
         edge_index, edge_attr = from_scipy_sparse_matrix(
-            self.adata.obsp["spatial_connectivities"]
+            self.adata.obsp["distances"]
         )
+
+        mask = edge_attr < 50
+        edge_index = edge_index[:, mask]
+        edge_attr = edge_attr[mask]
         for node_idx in tqdm(range(self.adata.shape[0])):
             # Extract k-hop subgraph with edge attributes
             subset, edge_index_sub, _, edge_mask = k_hop_subgraph(
-                node_idx, self.hops, edge_index, num_nodes=self.adata.shape[0], relabel_nodes=True
+                node_idx,
+                self.hops,
+                edge_index,
+                num_nodes=self.adata.shape[0],
+                relabel_nodes=True,
             )
 
             # Get spatial coordinates and features
@@ -283,29 +300,54 @@ class SpatialGraphDataset(InMemoryDataset):
             mean_expression = features.mean(dim=0)
             edge_attr_sub = edge_attr[edge_mask]
             # Create graph data object
-            graph = Data(
-                x=features,
-                edge_index=edge_index_sub,
-                edge_attr=edge_attr_sub,
-                pos=spatial_coords,
-                center_node_idx=node_idx,
-                mean_expression=mean_expression,
-            )
+            if self.batch_key:
+                batch = torch.tensor(self.adata.obs[self.batch_key][subset])
+                graph = Data(
+                    x=features,
+                    edge_index=edge_index_sub,
+                    edge_attr=edge_attr_sub,
+                    pos=spatial_coords,
+                    center_node_idx=node_idx,
+                    mean_expression=mean_expression,
+                    batch=batch,
+                )
+            else:
+                graph = Data(
+                    x=features,
+                    edge_index=edge_index_sub,
+                    edge_attr=edge_attr_sub,
+                    pos=spatial_coords,
+                    center_node_idx=node_idx,
+                    mean_expression=mean_expression,
+                    batch = torch.zeros(1, dtype=torch.long)
+                )
             graphs.append(graph)
 
         torch.save(self.collate(graphs), self.processed_paths[0])
 
 
+
 class BulkDataset(Dataset):
     """Dataset for bulk RNA with pseudo-bulk generation from spatial data"""
-    def __init__(self, adata=None, spatial_graph_dataset=None, hops=2):
+
+    def __init__(
+        self, 
+        adata: ad.AnnData | None = None, 
+        pheno_label: str = 'phenotype', 
+        spatial_graph_dataset: SpatialGraphDataset | None = None, 
+        hops: int = 2
+    ):
         if adata is not None:
             # Real bulk RNA mode
             self.mode = "real"
-            self.expressions = torch.tensor(
-                adata.X.toarray(), 
-                dtype=torch.float32
-            ) if hasattr(adata.X, "toarray") else torch.tensor(adata.X, dtype=torch.float32)
+            self.expressions = (
+                torch.tensor(adata.X.toarray(), dtype=torch.float32)
+                if hasattr(adata.X, "toarray")
+                else torch.tensor(adata.X, dtype=torch.float32)
+            )
+            self.phenotype_label = torch.tensor(
+                adata.obs[pheno_label].cat.codes.values, dtype=torch.long
+            )
         elif spatial_graph_dataset is not None:
             # Pseudo-bulk mode
             self.mode = "pseudo"
@@ -319,29 +361,38 @@ class BulkDataset(Dataset):
         """Generate pseudo-bulk from spatial graph data"""
         self.pseudo_expressions = []
         self.graph_indices = []
-        
+
         for idx in range(len(self.graph_dataset)):
             graph = self.graph_dataset[idx]
             self.pseudo_expressions.append(graph.mean_expression)
             self.graph_indices.append(idx)
-            
+
         self.pseudo_expressions = torch.stack(self.pseudo_expressions)
 
     def __len__(self):
-        return len(self.expressions) if self.mode == "real" else len(self.pseudo_expressions)
+        return (
+            len(self.expressions)
+            if self.mode == "real"
+            else len(self.pseudo_expressions)
+        )
 
     def __getitem__(self, idx):
         if self.mode == "real":
-            return {"expression": self.expressions[idx], "is_real": True}
+            return {
+                "expression": self.expressions[idx], 
+                "phenotype": self.phenotype_label[idx],
+                "is_real": True}
         else:
             return {
                 "expression": self.pseudo_expressions[idx],
                 "graph_idx": self.graph_indices[idx],
-                "is_real": False
+                "is_real": False,
             }
+
 
 class BulkDataModule(pl.LightningDataModule):
     """Handles real and pseudo-bulk data loading"""
+
     def __init__(
         self,
         bulk_adata: ad.AnnData = None,
@@ -350,7 +401,7 @@ class BulkDataModule(pl.LightningDataModule):
         batch_size: int = 128,
         num_workers: int = 4,
         val_split: float = 0.1,
-        test_split: float = 0.1
+        test_split: float = 0.1,
     ):
         super().__init__()
         self.bulk_adata = bulk_adata
@@ -365,9 +416,7 @@ class BulkDataModule(pl.LightningDataModule):
     def prepare_data(self):
         if self.spatial_adata is not None:
             self.spatial_graph_dataset = SpatialGraphDataset(
-                self.spatial_adata, 
-                name="pseudo_bulk_2c",
-                hops=self.spatial_hops
+                self.spatial_adata, name="pseudo_bulk_2c", hops=self.spatial_hops
             )
 
     def setup(self, stage=None):
@@ -378,58 +427,69 @@ class BulkDataModule(pl.LightningDataModule):
             self.train_idx = train_idx
             self.val_idx = val_idx
             self.test_idx = test_idx
-            
+
             self.real_train = BulkDataset(adata=self.bulk_adata[train_idx])
             self.real_val = BulkDataset(adata=self.bulk_adata[val_idx])
             self.real_test = BulkDataset(adata=self.bulk_adata[test_idx])
 
         if self.spatial_graph_dataset is not None:
             indices = np.arange(len(self.spatial_graph_dataset))
-            train_idx, test_idx = train_test_split(indices, test_size=self.test_split, random_state=42)
-            train_idx, val_idx = train_test_split(train_idx, test_size=self.val_split, random_state=42)
+            train_idx, test_idx = train_test_split(
+                indices, test_size=self.test_split, random_state=42
+            )
+            train_idx, val_idx = train_test_split(
+                train_idx, test_size=self.val_split, random_state=42
+            )
             self.train_idx = train_idx
             self.val_idx = val_idx
             self.test_idx = test_idx
-            
-            self.pseudo_train = BulkDataset(spatial_graph_dataset=Subset(self.spatial_graph_dataset, train_idx))
-            self.pseudo_val = BulkDataset(spatial_graph_dataset=Subset(self.spatial_graph_dataset, val_idx))
-            self.pseudo_test = BulkDataset(spatial_graph_dataset=Subset(self.spatial_graph_dataset, test_idx))
+
+            self.pseudo_train = BulkDataset(
+                spatial_graph_dataset=Subset(self.spatial_graph_dataset, train_idx)
+            )
+            self.pseudo_val = BulkDataset(
+                spatial_graph_dataset=Subset(self.spatial_graph_dataset, val_idx)
+            )
+            self.pseudo_test = BulkDataset(
+                spatial_graph_dataset=Subset(self.spatial_graph_dataset, test_idx)
+            )
 
     def train_dataloader(self):
-        if hasattr(self, 'real_train'):
+        if hasattr(self, "real_train"):
             real_loader = DataLoader(
                 self.real_train,
                 batch_size=self.batch_size,
                 shuffle=True,
                 num_workers=self.num_workers,
-                collate_fn=self._collate_fn
+                collate_fn=self._collate_fn,
             )
             return real_loader
 
-        if hasattr(self, 'pseudo_train'):
+        if hasattr(self, "pseudo_train"):
             pseudo_loader = DataLoader(
                 self.pseudo_train,
                 batch_size=self.batch_size,
                 shuffle=True,
                 num_workers=self.num_workers,
-                collate_fn=self._collate_fn
+                collate_fn=self._collate_fn,
             )
             return pseudo_loader
-        
+
     def _collate_fn(self, batch):
         """Custom collate to handle mixed real/pseudo batches"""
-        is_real = batch[0]['is_real']
-        expressions = torch.stack([item['expression'] for item in batch])
-        
+        is_real = batch[0]["is_real"]
+        expressions = torch.stack([item["expression"] for item in batch])
+
         if is_real:
-            return {'expression': expressions, 'is_real': True}
+            return {"expression": expressions, "is_real": True}
         else:
-            graph_indices = [item['graph_idx'] for item in batch]
+            graph_indices = [item["graph_idx"] for item in batch]
             return {
-                'expression': expressions,
-                'graph_indices': graph_indices,
-                'is_real': False
+                "expression": expressions,
+                "graph_indices": graph_indices,
+                "is_real": False,
             }
+
 
 class GraphContrastiveDataModule(pl.LightningDataModule):
     """DataModule for spatial graph contrastive learning"""
@@ -459,19 +519,21 @@ class GraphContrastiveDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         from torch.utils.data import Subset
+
         return PyGLoader(
             Subset(self.dataset, self.train_idx),
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            follow_batch=['x', 'mean_expression'],
+            follow_batch=["x", "mean_expression"],
         )
 
     def val_dataloader(self):
         from torch.utils.data import Subset
+
         return PyGLoader(
             Subset(self.dataset, self.val_idx),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            follow_batch=['x', 'mean_expression'],
+            follow_batch=["x", "mean_expression"],
         )

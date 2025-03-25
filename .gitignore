@@ -14,4 +14,6 @@ scripts/wandb/*
 scripts/lightning_logs/*
 scripts/SpatialGCL/*
 scripts/???/*
+scripts/*.png
+src/???/*
 scripts/figures/*
