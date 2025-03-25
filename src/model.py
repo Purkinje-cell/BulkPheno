@@ -138,7 +138,20 @@ class EmbeddingStore:
 
 
 class TripletLoss(nn.Module):
-    """Triplet loss with hard mining using L2 distance"""
+    """
+    Triplet loss with hard mining using L2 distance
+    Parameters
+    ----------
+    margin: float
+        Margin for triplet loss
+    
+    Forward Inputs
+    
+    embeddings: torch.Tensor
+        Embeddings to compute loss on
+    labels: torch.Tensor
+        Pseudo-labels for embeddings
+    """
 
     def __init__(self, margin=1.0):
         super().__init__()
@@ -658,7 +671,7 @@ class BulkEncoderModel(pl.LightningModule):
         # Loss components
         self.recon_loss = nn.MSELoss()
         self.align_loss = nn.MSELoss()
-        self.contrastive_loss = TripletGCLLoss(margin=1.0)
+        self.contrastive_loss = TripletLoss(margin=1.0)
 
     def forward(self, x):
         z = self.encoder(x)
@@ -682,9 +695,19 @@ class BulkEncoderModel(pl.LightningModule):
 
     def _real_batch_step(self, batch):
         x = batch["expression"]
+        label = batch["phenotype"]
         z, recon = self(x)
-        loss = self.recon_loss(recon, x) * self.hparams.recon_weight
-        self.log("train_real_loss", loss)
+        triplet_loss = self.contrastive_loss(z, label)
+        recon_loss = self.recon_loss(recon, x) * self.hparams.recon_weight
+        loss = triplet_loss + recon_loss
+
+        self.log_dict(
+            {
+                "train_real_recon_loss": recon_loss,
+                "train_real_triplet_loss": triplet_loss,
+                "train_real_total_loss": loss,
+            }
+        )
         return loss
 
     def _pseudo_batch_step(self, batch):
@@ -696,7 +719,7 @@ class BulkEncoderModel(pl.LightningModule):
 
         # Get corresponding GCL embeddings
         with torch.no_grad():
-            graphs = [self.g_dataset[idx] for idx in graph_indices]
+            graphs = [self.graph_dataset[idx] for idx in graph_indices]
             batch = Batch.from_data_list(graphs).to(self.device)
             z_gcl = self.gcl_encoder.encode(
                 batch.x, batch.edge_index, batch.edge_attr, batch.batch
