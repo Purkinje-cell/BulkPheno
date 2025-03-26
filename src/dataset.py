@@ -1,15 +1,17 @@
+from matplotlib import pyplot as plt
 import pandas as pd
 import torch
 import numpy as np
 import scanpy as sc
 import anndata as ad
 import pytorch_lightning as pl
+import seaborn as sns
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
 from sklearn.model_selection import train_test_split
 from torch_geometric.data import Data, InMemoryDataset, Batch
 from torch_geometric.loader import DataLoader as PyGLoader
-from torch_geometric.utils import k_hop_subgraph, from_scipy_sparse_matrix
+from torch_geometric.utils import k_hop_subgraph, from_scipy_sparse_matrix, remove_self_loops
 from tqdm import tqdm
 
 # TripletSelector class removed as we now use online hard mining
@@ -248,6 +250,7 @@ class SpatialGraphDataset(InMemoryDataset):
         name: str, 
         batch_key=None, 
         hops=2, 
+        root="../data",
         transform=None):
         """
         Args:
@@ -259,22 +262,24 @@ class SpatialGraphDataset(InMemoryDataset):
         self.name = name
         self.hops = hops
         self.batch_key = batch_key
-        super().__init__(transform=transform)
+        super().__init__(root=root, transform=transform)
         self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
 
     @property
     def processed_file_names(self):
-        return [f"../processed/spatial_graph_data_{self.name}.pt"]
+        return [f"spatial_graph_data_{self.name}.pt"]
 
     def process(self):
         graphs = []
         edge_index, edge_attr = from_scipy_sparse_matrix(
             self.adata.obsp["distances"]
         )
-
         mask = edge_attr < 50
         edge_index = edge_index[:, mask]
         edge_attr = edge_attr[mask]
+        edge_index, edge_attr = remove_self_loops(edge_index, edge_attr)
+        sns.displot(edge_attr, bins=100)
+        plt.savefig(f'../figures/{self.name}_edge_length.png')
         for node_idx in tqdm(range(self.adata.shape[0])):
             # Extract k-hop subgraph with edge attributes
             subset, edge_index_sub, _, edge_mask = k_hop_subgraph(
@@ -284,8 +289,10 @@ class SpatialGraphDataset(InMemoryDataset):
                 num_nodes=self.adata.shape[0],
                 relabel_nodes=True,
             )
-
             # Get spatial coordinates and features
+            if subset.shape[0] <= 1:
+                print(f'Node {node_idx} has no neighbors')
+                continue
             spatial_coords = torch.tensor(
                 self.adata.obsm["spatial"][subset], dtype=torch.float
             )
@@ -301,7 +308,7 @@ class SpatialGraphDataset(InMemoryDataset):
             edge_attr_sub = edge_attr[edge_mask]
             # Create graph data object
             if self.batch_key:
-                batch = torch.tensor(self.adata.obs[self.batch_key][subset])
+                batch = torch.tensor(self.adata.obs[self.batch_key][node_idx]).reshape(-1)
                 graph = Data(
                     x=features,
                     edge_index=edge_index_sub,

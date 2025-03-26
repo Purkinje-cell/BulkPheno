@@ -925,6 +925,7 @@ class GraphContrastiveModel(pl.LightningModule):
         # Reconstruction loss
         recon = self.decoder(z_orig)
         recon = recon.reshape(-1)
+        print(recon.shape)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
 
         # Total loss
@@ -965,6 +966,7 @@ class GraphContrastiveModel(pl.LightningModule):
         # Reconstruction loss
         recon = self.decoder(z_orig)
         recon = recon.reshape(-1)
+        print(recon.shape)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
 
         # Total loss
