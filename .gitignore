@@ -19,3 +19,5 @@ scripts/figures/*
 figures/*
 models/*
 output/*
+src/SpatialGCL/*
+src/wandb/*

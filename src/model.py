@@ -38,6 +38,7 @@ from torch_geometric.nn import (
     PNAConv,
     SAGEConv,
     global_add_pool,
+    ASAPooling,
     global_mean_pool,
 )
 from torch_geometric.utils import to_dense_adj, to_scipy_sparse_matrix, k_hop_subgraph
@@ -658,15 +659,40 @@ class BulkEncoderModel(pl.LightningModule):
         )
 
         # Initialize decoder from GCL model and freeze
-        self.decoder = gcl_model.decoder
-        for param in self.decoder.parameters():
-            param.requires_grad = False
+
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, gcl_model.hparams.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(gcl_model.hparams.hidden_dim, input_dim),
+        )
+        
+        # Copy weights from the GCL model's decoder
+        with torch.no_grad():
+            # Get state dict from GCL model's decoder
+            gcl_decoder_state_dict = gcl_model.decoder.state_dict()
+            
+            # Initialize our decoder with these weights
+            # Need to ensure compatible architecture
+            decoder_state_dict = self.decoder.state_dict()
+            
+            # Only copy parameters with matching names and shapes
+            for name, param in gcl_decoder_state_dict.items():
+                if name in decoder_state_dict and decoder_state_dict[name].shape == param.shape:
+                    decoder_state_dict[name].copy_(param)
+            
+            # Load the modified state dict
+            self.decoder.load_state_dict(decoder_state_dict)
+            
+            # Freeze decoder parameters
+            for param in self.decoder.parameters():
+                param.requires_grad = False
+
 
         # Store reference to GCL model
-        self.gcl_encoder = gcl_model
-        self.gcl_encoder.eval()
-        for param in self.gcl_encoder.parameters():
-            param.requires_grad = False
+        # self.gcl_encoder = gcl_model
+        # self.gcl_encoder.eval()
+        # for param in self.gcl_encoder.parameters():
+        #     param.requires_grad = False
 
         # Loss components
         self.recon_loss = nn.MSELoss()
@@ -682,16 +708,16 @@ class BulkEncoderModel(pl.LightningModule):
         if batch["is_real"]:
             return self._real_batch_step(batch)
         else:
-            return self._pseudo_batch_step(batch)
+            return self._pseudo_batch_step(batch, stage="train")
 
     def validation_step(self, batch, batch_idx):
         if batch["is_real"]:
             return self._real_batch_step(batch)
         else:
-            return self._pseudo_batch_step
+            return self._pseudo_batch_step(batch, stage="val")
 
-    def set_graph_dataset(self, dataset):
-        self.graph_dataset = dataset
+    def set_graph_embedding(self, graph_embedding: torch.Tensor):
+        self.graph_embedding = graph_embedding
 
     def _real_batch_step(self, batch):
         x = batch["expression"]
@@ -710,7 +736,7 @@ class BulkEncoderModel(pl.LightningModule):
         )
         return loss
 
-    def _pseudo_batch_step(self, batch):
+    def _pseudo_batch_step(self, batch, stage="train"):
         x = batch["expression"]
         graph_indices = batch["graph_indices"]
 
@@ -719,23 +745,22 @@ class BulkEncoderModel(pl.LightningModule):
 
         # Get corresponding GCL embeddings
         with torch.no_grad():
-            graphs = [self.graph_dataset[idx] for idx in graph_indices]
-            batch = Batch.from_data_list(graphs).to(self.device)
-            z_gcl = self.gcl_encoder.encode(
-                batch.x, batch.edge_index, batch.edge_attr, batch.batch
-            )
+            z_gcl = [self.graph_embedding[idx] for idx in graph_indices]
+            z_gcl = torch.stack(z_gcl)
+            z_gcl = z_gcl.to(self.device)
 
         # Calculate losses
         recon_loss = self.recon_loss(recon, x) * self.hparams.recon_weight
         align_loss = self.align_loss(z_bulk, z_gcl) * self.hparams.align_weight
+        # triplet_loss = self.contrastive_loss(z_bulk, batch["label"])
         total_loss = recon_loss + align_loss
         # total_loss = recon_loss
 
         self.log_dict(
             {
-                "train_pseudo_recon_loss": recon_loss,
-                "train_align_loss": align_loss,
-                "train_pseudo_total_loss": total_loss,
+                f"{stage}_pseudo_recon_loss": recon_loss,
+                f"{stage}_align_loss": align_loss,
+                f"{stage}_pseudo_total_loss": total_loss,
             }
         )
         return total_loss
@@ -773,13 +798,42 @@ class GraphContrastiveModel(pl.LightningModule):
         recon_weight: float = 0.5,
         feature_drop_rate: float = 0.1,
         edge_drop_rate: float = 0.2,
+        conv_layer: str = "GAT",
         lr: float = 1e-3,
     ):
         super().__init__()
         self.save_hyperparameters()
         # GNN encoder
-        self.conv1 = GATConv(input_dim, hidden_dim, edge_dim=1)
-        self.conv2 = GATConv(hidden_dim, hidden_dim, edge_dim=1)
+        self.conv_layer = conv_layer
+        if conv_layer == "GAT":
+            self.conv1 = GATConv(input_dim, hidden_dim, edge_dim=1)
+            self.conv2 = GATConv(hidden_dim, hidden_dim, edge_dim=1)
+        elif conv_layer == "GCN":
+            self.conv1 = GCNConv(input_dim, hidden_dim)
+            self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        elif conv_layer == "GIN":
+            self.conv1 = GINConv(
+                nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+            )
+            self.conv2 = GINConv(
+                nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+            )
+        elif conv_layer == "PNA":
+            self.conv1 = PNAConv(
+                input_dim, hidden_dim, aggregators=["mean", "min", "max", "std"]
+            )
+            self.conv2 = PNAConv(
+                hidden_dim, hidden_dim, aggregators=["mean", "min", "max", "std"]
+            )
+
         self.project = nn.Linear(hidden_dim, latent_dim)
         # Reconstruction decoder
         self.decoder = nn.Sequential(
@@ -796,8 +850,9 @@ class GraphContrastiveModel(pl.LightningModule):
 
     def encode(self, x, edge_index, edge_attr, batch=None):
         """Encode graph data to latent space"""
-        self.eval()
         # First graph convolution
+        if self.conv_layer in ['GCN', 'GIN']:
+            x = self.conv1(x, edge_index).relu()
         x = self.conv1(x, edge_index, edge_attr=edge_attr).relu()
 
         # Second graph convolution
@@ -818,17 +873,8 @@ class GraphContrastiveModel(pl.LightningModule):
             data.edge_attr,
             data.batch,
         )
-        x = self.conv1(x, edge_index, edge_attr=edge_attr).relu()
-
-        # Second graph convolution
-        x = self.conv2(x, edge_index, edge_attr=edge_attr)
-        x = F.relu(x)
-        x = self.project(x)
-
-        # If batch indices provided, pool to graph-level embeddings
-        if batch is not None:
-            return global_mean_pool(x, batch)
-        return x
+        z = self.encode(x, edge_index, edge_attr, batch)
+        return z
 
     def _augment_graph(self, graph):
         """Augmentation preserving center node ID"""
@@ -925,7 +971,6 @@ class GraphContrastiveModel(pl.LightningModule):
         # Reconstruction loss
         recon = self.decoder(z_orig)
         recon = recon.reshape(-1)
-        print(recon.shape)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
 
         # Total loss
@@ -966,7 +1011,6 @@ class GraphContrastiveModel(pl.LightningModule):
         # Reconstruction loss
         recon = self.decoder(z_orig)
         recon = recon.reshape(-1)
-        print(recon.shape)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
 
         # Total loss

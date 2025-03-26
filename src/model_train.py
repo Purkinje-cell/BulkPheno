@@ -10,6 +10,7 @@ import scanpy as sc
 import scipy.sparse as sp
 import torch
 import seaborn as sns
+from datetime import datetime
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 
@@ -17,6 +18,7 @@ from dataset import GraphContrastiveDataModule, SpatialGraphDataset, BulkDataMod
 from model import GraphContrastiveModel, BulkEncoderModel, EmbeddingStore
 from lightning.pytorch.loggers import WandbLogger
 from torch_geometric.loader import DataLoader
+from torch.utils.data import Subset
 from torch.utils.data import DataLoader as TorchDataLoader
 from torch_scatter import scatter_add, scatter_mean
 
@@ -100,7 +102,10 @@ def main():
     os.makedirs(config['model_dir'], exist_ok=True)
     
     # Save config
-    config_path = os.path.join(config['output_dir'], 'config.yaml')
+    current_time = datetime.now()
+    time_str = current_time.strftime("%Y-%m-%d %H-%M")
+
+    config_path = os.path.join(config['output_dir'], config['gcl_conv_layer'] + '_' + time_str + '_config.yaml')
     with open(config_path, 'w') as f:
         yaml.dump(config, f)
     
@@ -146,7 +151,7 @@ def main():
     )
     
     # Initialize WandB logger
-    wandb_logger_gcl = WandbLogger(project=config['wandb_project'], name=f"{config['spatial_dataset']}_gcl")
+    wandb_logger_gcl = WandbLogger(project=config['wandb_project'], name=f"{config['spatial_dataset']}_gcl", version=time_str)
     
     # Save hyperparameters to WandB
     wandb_logger_gcl.log_hyperparams(config)
@@ -157,8 +162,11 @@ def main():
         latent_dim=config['gcl_latent_dim'],
         hidden_dim=config['gcl_hidden_dim'],
         recon_weight=config['gcl_recon_weight'],
-        margin=config['gcl_margin']
+        margin=config['gcl_margin'],
+        conv_layer=config['gcl_conv_layer'],
     )
+
+    wandb_logger_gcl.watch(graph_model, log='all', log_freq=500)
     
     graph_trainer = pl.Trainer(
         max_epochs=config['gcl_max_epochs'],
@@ -172,8 +180,41 @@ def main():
     graph_model_path = os.path.join(config['model_dir'], f"{config['spatial_dataset']}_gcl.pt")
     torch.save(graph_model.state_dict(), graph_model_path)
     
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=True, 
+        follow_batch=['x', 'mean_expression']
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        follow_batch=['x', 'mean_expression']
+    )
+    graph_train_embeddings = []
+    graph_val_embeddings = []
+    graph_model = graph_model.to(config['device'])
+    graph_model.eval()
+    with torch.no_grad():
+        for batch in train_loader:
+            batch = batch.to(config['device'])
+            x, edge_index, edge_attr, batch_idx = batch.x, batch.edge_index, batch.edge_attr, batch.batch
+            z = graph_model.encode(x, edge_index, edge_attr, batch_idx)
+            graph_train_embeddings.append(z.detach().cpu())
+        for batch in val_loader:
+            batch = batch.to(config['device'])
+            x, edge_index, edge_attr, batch_idx = batch.x, batch.edge_index, batch.edge_attr, batch.batch
+            z = graph_model.encode(x, edge_index, edge_attr, batch_idx)
+            graph_val_embeddings.append(z.detach().cpu())
+    
+    # Concatenate results
+    graph_train_embeddings = torch.cat(graph_train_embeddings, dim=0)
+    graph_val_embeddings = torch.cat(graph_val_embeddings, dim=0)
+    graph_embeddings = torch.cat([graph_train_embeddings, graph_val_embeddings], dim=0)
+    print(f"Graph embeddings shape: {graph_embeddings.shape}")
     # Initialize WandB logger for bulk encoder
-    wandb_logger_bulk = WandbLogger(project=config['wandb_project'], name=f"{config['spatial_dataset']}_bulk")
+    wandb_logger_bulk = WandbLogger(project=config['wandb_project'], name=f"{config['spatial_dataset']}_bulk", version=time_str)
     
     # Train bulk encoder model
     bulk_encode_model = BulkEncoderModel(
@@ -182,9 +223,16 @@ def main():
         latent_dim=config['bulk_latent_dim'],
         hidden_dims=config['bulk_hidden_dims']
     )
+
+    wandb_logger_bulk.watch(bulk_encode_model, log='all', log_freq=500)
+
+    bulk_dataset = BulkDataset(spatial_graph_dataset=graph_dataset)
+    bulk_train_dataset = Subset(bulk_dataset, train_idx)
+    bulk_val_dataset = Subset(bulk_dataset, val_idx)
+        
     
     bulk_train_loader = TorchDataLoader(
-        train_dataset, 
+        bulk_train_dataset,
         batch_size=config['batch_size'], 
         shuffle=True, 
         num_workers=config['num_workers'], 
@@ -192,14 +240,14 @@ def main():
     )
     
     bulk_val_loader = TorchDataLoader(
-        val_dataset, 
+        bulk_val_dataset, 
         batch_size=config['batch_size'], 
         shuffle=False, 
         num_workers=config['num_workers'], 
         collate_fn=collate_fn_new
     )
     
-    bulk_encode_model.set_graph_dataset(train_dataset)
+    bulk_encode_model.set_graph_embedding(graph_embeddings)
     
     bulk_trainer = pl.Trainer(
         max_epochs=config['bulk_max_epochs'],
@@ -207,33 +255,11 @@ def main():
         logger=wandb_logger_bulk
     )
     
-    bulk_trainer.fit(bulk_encode_model, bulk_train_loader)
+    bulk_trainer.fit(bulk_encode_model, bulk_train_loader, bulk_val_loader)
     
     # Save bulk model
     bulk_model_path = os.path.join(config['model_dir'], f"{config['spatial_dataset']}_bulk.pt")
     torch.save(bulk_encode_model.state_dict(), bulk_model_path)
-    
-    # Get graph embeddings
-    graph_loader = DataLoader(
-        graph_dataset, 
-        batch_size=config['batch_size'], 
-        shuffle=False, 
-        follow_batch=['x', 'mean_expression']
-    )
-    
-    graph_embeddings = []
-    graph_model = graph_model.to(config['device'])
-    graph_model.eval()
-    with torch.no_grad():
-        for batch in graph_loader:
-            batch = batch.to(config['device'])
-            x, edge_index, edge_attr, batch_idx = batch.x, batch.edge_index, batch.edge_attr, batch.batch
-            z = graph_model.encode(x, edge_index, edge_attr, batch_idx)
-            graph_embeddings.append(z.cpu().numpy())
-    
-    # Concatenate results
-    graph_embeddings = np.concatenate(graph_embeddings, axis=0)
-    print(f"Graph embeddings shape: {graph_embeddings.shape}")
     
     # Filter bulk data based on query column if needed
     if config.get('query_filter'):

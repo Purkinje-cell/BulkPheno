@@ -7,9 +7,9 @@ figure_dir: "../figures"
 model_dir: "../models"
 
 # Dataset configuration
-spatial_dataset_path: "MERFISH/HC1_region_sampled.h5ad"
+spatial_dataset_path: "MERFISH/HC_2sample_combined_sampled.h5ad"
 bulk_dataset_path: "TCGA/Processed/TCGA_LIHC.h5ad"
-spatial_dataset: "HC1_region_sampled_hop2"
+spatial_dataset: "HC2combined_sampled_hop2"
 bulk_dataset: "TCGA_LIHC"
 spatial_color_by: "sub_cell_type"
 
@@ -22,11 +22,12 @@ distance_metric: "cosine"
 # Training parameters
 seed: 42
 train_ratio: 0.8
-batch_size: 512
+batch_size: 128
 num_workers: 4
 device: "cuda"
 log_every_n_steps: 5
 wandb_project: "SpatialGCL"
+run_name: "GAT"
 
 # Spatial graph parameters
 n_neighbors: 20
@@ -38,9 +39,10 @@ gcl_hidden_dim: 128
 gcl_recon_weight: 0.8
 gcl_margin: 1.0
 gcl_max_epochs: 10
+gcl_conv_layer: 'GAT'
 
 # Bulk encoder model parameters
-bulk_latent_dim: 64
+bulk_latent_dim: 32
 bulk_hidden_dims: [256, 128]
 bulk_max_epochs: 20
 
