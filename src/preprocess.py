@@ -44,12 +44,12 @@ clinical_data.columns.to_series().to_csv('../data/TCGA/Processed/clinical_data.c
 bulk_TCGA_adata = sc.AnnData(X=exp_data.values, obs=clinical_data)
 bulk_TCGA_adata.write_h5ad('../data/TCGA/Processed/TCGA_LIHC.h5ad')
 
-use_region = sc.read_h5ad('../data/MERFISH/HC1_region_3_test_pipe.h5ad')
+use_region = sc.read_h5ad('../data/MERFISH/HC1_processed.h5ad')
 use_region = use_region[:, common_genes]
 sc.pl.embedding(use_region, basis='spatial',  color='sub_cell_type')
 sc.pp.neighbors(use_region, n_neighbors=20, use_rep='spatial')
 import scipy.sparse as sp
 use_region.obsp['spatial_connectivities'] = sp.coo_matrix((use_region.obsp['distances'] > 0).astype(int))
 use_region.obsp['spatial_distances'] = use_region.obsp['distances']
-graph_dataset = SpatialGraphDataset(use_region, name='HC1_region3_test', hops=2)
+graph_dataset = SpatialGraphDataset(use_region, name='HC1_processed', hops=3)
 print(f'Length of graph dataset 0 is {len(graph_dataset)}')
