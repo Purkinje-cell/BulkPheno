@@ -6,6 +6,7 @@ import scanpy as sc
 import anndata as ad
 import pytorch_lightning as pl
 import seaborn as sns
+import os
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
 from sklearn.model_selection import train_test_split
@@ -340,7 +341,7 @@ class BulkDataset(Dataset):
     def __init__(
         self, 
         adata: ad.AnnData | None = None, 
-        pheno_label: str = 'phenotype', 
+        pheno_label: str | None = None, 
         spatial_graph_dataset: SpatialGraphDataset | None = None, 
         hops: int = 2
     ):
@@ -352,9 +353,12 @@ class BulkDataset(Dataset):
                 if hasattr(adata.X, "toarray")
                 else torch.tensor(adata.X, dtype=torch.float32)
             )
-            self.phenotype_label = torch.tensor(
-                adata.obs[pheno_label].cat.codes.values, dtype=torch.long
-            )
+            if pheno_label:
+                self.phenotype_label = torch.tensor(
+                    adata.obs[pheno_label].cat.codes.values, dtype=torch.long
+                )
+            else:
+                self.phenotype_label = torch.zeros(len(adata), dtype=torch.long)
         elif spatial_graph_dataset is not None:
             # Pseudo-bulk mode
             self.mode = "pseudo"
@@ -544,3 +548,112 @@ class GraphContrastiveDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             follow_batch=["x", "mean_expression"],
         )
+
+class SpatialGraphDataset(Dataset):  # 改为继承基础 Dataset
+    """
+    改进版：逐样本存储，按需加载
+    """
+
+    def __init__(
+        self,
+        adata: ad.AnnData,
+        name: str,
+        batch_key=None,
+        hops=2,
+        root="../data",
+        transform=None):
+        
+        self.adata = adata
+        self.name = name
+        self.hops = hops
+        self.batch_key = batch_key
+        self.graph_dir = os.path.join(root, "processed", f"graphs_{name}")  # 单独存储图的目录
+        
+        super().__init__(root=root, transform=transform)
+        
+        # 预处理检查
+        if not os.path.exists(self._get_meta_path()):
+            self._preprocess()
+            
+        # 加载有效索引列表
+        self.valid_indices = torch.load(self._get_meta_path())
+
+    def _get_meta_path(self):
+        return os.path.join(self.processed_dir, f"valid_indices_{self.name}.pt")
+
+    def _preprocess(self):
+        """预处理并存储中间结果"""
+        os.makedirs(self.graph_dir, exist_ok=True)
+        
+        edge_index, edge_attr = from_scipy_sparse_matrix(self.adata.obsp["distances"])
+        mask = edge_attr < 50
+        edge_index = edge_index[:, mask]
+        edge_attr = edge_attr[mask]
+        edge_index, edge_attr = remove_self_loops(edge_index, edge_attr)
+
+        valid_indices = []
+        for node_idx in tqdm(range(self.adata.shape[0])):
+            subset, edge_index_sub, _, edge_mask = k_hop_subgraph(
+                node_idx,
+                self.hops,
+                edge_index,
+                num_nodes=self.adata.shape[0],
+                relabel_nodes=True,
+            )
+            # Get spatial coordinates and features
+            if subset.shape[0] <= 1:
+                print(f'Node {node_idx} has no neighbors')
+                continue
+            spatial_coords = torch.tensor(
+                self.adata.obsm["spatial"][subset], dtype=torch.float
+            )
+            if hasattr(self.adata.X, "toarray"):
+                features = torch.tensor(
+                    self.adata.X[subset].toarray(), dtype=torch.float
+                )
+            else:
+                features = torch.tensor(self.adata.X[subset], dtype=torch.float)
+
+            # Calculate reconstruction target
+            mean_expression = features.mean(dim=0)
+            edge_attr_sub = edge_attr[edge_mask]
+            # Create graph data object
+            if self.batch_key:
+                batch = torch.tensor(self.adata.obs[self.batch_key][node_idx]).reshape(-1)
+                graph = Data(
+                    x=features,
+                    edge_index=edge_index_sub,
+                    edge_attr=edge_attr_sub,
+                    pos=spatial_coords,
+                    center_node_idx=node_idx,
+                    mean_expression=mean_expression,
+                    batch=batch,
+                )
+            else:
+                graph = Data(
+                    x=features,
+                    edge_index=edge_index_sub,
+                    edge_attr=edge_attr_sub,
+                    pos=spatial_coords,
+                    center_node_idx=node_idx,
+                    mean_expression=mean_expression,
+                    batch = torch.zeros(1, dtype=torch.long)
+                )
+            torch.save(graph, os.path.join(self.graph_dir, f"graph_{node_idx}.pt"))
+            valid_indices.append(node_idx)
+
+        # 保存有效索引列表
+        torch.save(valid_indices, self._get_meta_path())
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def __getitem__(self, idx):
+        node_idx = self.valid_indices[idx]
+        data = torch.load(os.path.join(self.graph_dir, f"graph_{node_idx}.pt"))
+        return data if self.transform is None else self.transform(data)
+
+    @property
+    def processed_file_names(self):
+        """返回关键元数据文件"""
+        return [f"valid_indices_{self.name}.pt"]
