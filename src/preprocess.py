@@ -72,28 +72,17 @@ if __name__ == '__main__':
     
     # Create output directory if needed
     os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs('./log', exist_ok=True)  # Create log directory for SLURM outputs
     
     # Process TCGA data first
     TCGA_LIHC = pd.read_table(args.tcga_path, index_col=0)
-    exp_data = TCGA_LIHC.T
-    clinical_data = pd.read_table('../data/TCGA/TCGA-LIHC.GDC_phenotype.tsv', index_col=0)
-    survival_data = pd.read_table('../data/TCGA/TCGA-LIHC.survival.tsv', index_col=0)
-    clinical_data = survival_data.merge(clinical_data, left_index=True, right_index=True)
-    common_sample = np.intersect1d(exp_data.index, clinical_data.index)
-    exp_data = exp_data.loc[common_sample]
-    clinical_data = clinical_data.loc[common_sample]
     
-    # Ensure output directory exists
-    os.makedirs('../data/TCGA/Processed', exist_ok=True)
-    clinical_data.columns.to_series().to_csv('../data/TCGA/Processed/clinical_data.csv', index=False)
-    
-    bulk_TCGA_adata = sc.AnnData(X=exp_data.values, obs=clinical_data)
-    bulk_TCGA_adata.write_h5ad('../data/TCGA/Processed/TCGA_LIHC.h5ad')
-
     # Process spatial data
     if args.input:
+        print(f"Processing single file: {args.input}")
         process_adata(args.input, args.output_dir, args.hops, args.tcga_path)
     elif args.input_dir:
+        print(f"Processing all files in directory: {args.input_dir}")
         for fname in os.listdir(args.input_dir):
             if fname.endswith('.h5ad'):
                 process_adata(
@@ -110,7 +99,6 @@ if __name__ == '__main__':
         use_region = sc.read_h5ad(default_input)
         common_genes = np.intersect1d(use_region.var_names, TCGA_LIHC.index.values)
         use_region = use_region[:, common_genes]
-        sc.pl.embedding(use_region, basis='spatial', color='sub_cell_type')
         sc.pp.neighbors(use_region, n_neighbors=20, use_rep='spatial')
         import scipy.sparse as sp
         use_region.obsp['spatial_connectivities'] = sp.coo_matrix((use_region.obsp['distances'] > 0).astype(int))
