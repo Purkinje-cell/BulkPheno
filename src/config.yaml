@@ -7,9 +7,9 @@ figure_dir: "../figures"
 model_dir: "../models"
 
 # Dataset configuration
-spatial_dataset_path: "MERFISH/HC_2sample_combined_sampled.h5ad"
+spatial_dataset_path: "MERFISH/HC1_region_sampled.h5ad"
 bulk_dataset_path: "TCGA/Processed/TCGA_LIHC.h5ad"
-spatial_dataset: "HC2combined_sampled_hop2"
+spatial_dataset: "HC1_region_sampled_hop3"
 bulk_dataset: "TCGA_LIHC"
 spatial_color_by: "sub_cell_type"
 
@@ -31,7 +31,7 @@ run_name: "GAT"
 
 # Spatial graph parameters
 n_neighbors: 20
-hops: 2
+hops: 3
 
 # Graph Contrastive Learning model parameters
 gcl_latent_dim: 32

@@ -10,6 +10,7 @@ import scanpy as sc
 import scipy.sparse as sp
 import torch
 import seaborn as sns
+import gc
 from datetime import datetime
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
@@ -89,6 +90,8 @@ def load_data(config):
     if 'neighbors' not in spatial_adata.uns:
         sc.pp.neighbors(spatial_adata, n_neighbors=config['n_neighbors'], use_rep='spatial')
     
+    spatial_adata.obsp['spatial_connectivities'] = sp.coo_matrix((spatial_adata.obsp['distances'] > 0).astype(int))
+    spatial_adata.obsp['spatial_distances'] = spatial_adata.obsp['distances']
     return bulk_adata, spatial_adata, common_genes
 
 def main():
@@ -280,11 +283,14 @@ def main():
     bulk_embedding_store.build_index(bulk_embedding, bulk_labels, bulk_ids)
     
     query_k = config.get('query_k', 200)
-    query_res = bulk_embedding_store.query(graph_embeddings, k=query_k)
     
+    del graph_dataset
+    gc.collect()
+    query_res = bulk_embedding_store.query(graph_embeddings, k=query_k)
     # Process query results
     distance_tensor = torch.Tensor(query_res['distances'])
-    label_tensor = torch.Tensor(query_res['labels'].codes).to(torch.long)
+    label_code = query_res['labels'].codes.copy()
+    label_tensor = torch.Tensor(label_code).to(torch.long)
     sim_tensor = scatter_mean(distance_tensor, label_tensor, dim=1)
     sim = sim_tensor.numpy()
     sim_df = pd.DataFrame(sim, columns=bulk_query.obs[config['query_column']].cat.categories)
@@ -297,12 +303,12 @@ def main():
     rank_sum_df = pd.DataFrame(rank_sum, columns=bulk_query.obs[config['query_column']].cat.categories)
     
     # Spatial smoothing
-    spatial_adata.obsp['spatial_connectivities'] = sp.csr_matrix(spatial_adata.obsp['spatial_connectivities'])
-    sim_new = spatial_adata.obsp['spatial_connectivities'] @ sim / config['n_neighbors']
-    sim_smoothed_df = pd.DataFrame(sim_new, columns=bulk_query.obs[config['query_column']].cat.categories)
+    # spatial_adata.obsp['spatial_connectivities'] = sp.csr_matrix(spatial_adata.obsp['spatial_connectivities'])
+    # sim_new = spatial_adata.obsp['spatial_connectivities'] @ sim / config['n_neighbors']
+    sim_smoothed_df = sim_df
     
     # Add results to spatial adata
-    sim_smoothed_df.index = spatial_adata[graph_dataset[sim_smoothed_df.index.values].center_node_idx.numpy()].obs_names
+    sim_smoothed_df.index = spatial_adata[sim_smoothed_df.index.values].obs_names
     
     # Drop columns if they already exist
     cols = []
@@ -313,7 +319,7 @@ def main():
     if cols:
         spatial_adata.obs = spatial_adata.obs.drop(columns=cols)
 
-    spatial_adata.obs = spatial_adata.obs.merge(sim_smoothed_df, left_index=True, right_index=True)
+    spatial_adata.obs = spatial_adata.obs.merge(sim_smoothed_df, left_index=True, right_index=True, how='left')
     
     # Add prediction
     spatial_adata.obs['Prediction'] = spatial_adata.obs[sim_smoothed_df.columns.tolist()].idxmax(axis=1)

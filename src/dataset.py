@@ -603,4 +603,3 @@ class GraphContrastiveDataModule(pl.LightningDataModule):
             follow_batch=["x", "mean_expression"],
         )
 
-# This class has been replaced by the memory-efficient implementation above
