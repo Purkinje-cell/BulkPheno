@@ -831,6 +831,7 @@ class GraphContrastiveModel(pl.LightningModule):
         self.save_hyperparameters()
         # GNN encoder
         self.conv_layer = conv_layer
+        self.automatic_optimization = False
         if conv_layer == "GAT":
             self.conv1 = GATConv(input_dim, hidden_dim, edge_dim=1)
             self.conv2 = GATConv(hidden_dim, hidden_dim, edge_dim=1)
@@ -865,6 +866,7 @@ class GraphContrastiveModel(pl.LightningModule):
             nn.ReLU(),
             nn.Linear(latent_dim, latent_dim),
         )
+            
         # Reconstruction decoder
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
@@ -876,6 +878,20 @@ class GraphContrastiveModel(pl.LightningModule):
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim, input_dim),
+        )
+
+        self.regressor = nn.Sequential(
+            nn.Linear(latent_dim * 2, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
         )
         # Triplet loss with hard mining
         self.triplet_loss = TripletGCLLoss(margin=margin)
@@ -984,20 +1000,23 @@ class GraphContrastiveModel(pl.LightningModule):
 
     def sample_graphs(self, data:Data, ratio:float=0.8):
         """Sample a batch of graphs for triplet mining"""
-        sample_indices = torch.randperm(data.num_nodes)
+        # 确保sample_indices在与data.edge_index相同的设备上
+        device = data.edge_index.device
+        sample_indices = torch.randperm(data.num_nodes, device=device)
         split_idx = int(ratio * len(sample_indices))
         sample_indices = sample_indices[:split_idx]
         
+        # 确保所有张量在同一设备上
         edge_index, edge_attr = subgraph(sample_indices, data.edge_index, data.edge_attr, relabel_nodes=True)
         x = data.x[sample_indices]
-        batch = data.batch[sample_indices] if data.batch is not None else None
-        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, batch=batch)
+        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+
         
 
     def training_step(self, batch: Batch, batch_idx):
         # Generate augmented view
         # augmented_batch = self._augment_batch(batch)
-        
+        regressor_optimizer, graph_encoder_decoder_optimizer = self.optimizers()
         data_list = batch.to_data_list()
         global_views_1 = []
         global_views_2 = []
@@ -1019,8 +1038,18 @@ class GraphContrastiveModel(pl.LightningModule):
         local_views_2 = Batch.from_data_list(local_views_2)
         z_global_1 = self(global_views_1)
         z_global_2 = self(global_views_2)
-        z_local_1 = self(local_views_1)
-        z_local_2 = self(local_views_2)
+        z_local_1 = self(local_views_1) # (batch_size, latent_dim)
+        z_local_2 = self(local_views_2) # (batch_size, latent_dim)
+        z_local_2_neg = z_local_2[torch.randperm(z_local_2.size(0))]
+        z_local_mix = torch.cat([z_local_1, z_local_2], dim=1) # (batch_size, 2 * latent_dim)
+        z_local_mix_neg = torch.cat([z_local_1, z_local_2_neg], dim=1) # (batch_size, 2 * latent_dim)
+        mix_score = torch.mean(self.regressor(z_local_mix)) # (1)
+        mix_neg_score = torch.mean(self.regressor(z_local_mix_neg)) # (1)
+        loss_ll = -(mix_score - mix_neg_score)
+        regressor_optimizer.zero_grad()
+        self.manual_backward(loss_ll)
+        regressor_optimizer.step()
+        
 
         # Get embeddings for both original and augmented
         z_orig = self(batch)
@@ -1032,6 +1061,10 @@ class GraphContrastiveModel(pl.LightningModule):
         #     [batch.center_node_idx, batch.center_node_idx], dim=0
         # )
 
+        z_local_1 = self(local_views_1) # (batch_size, latent_dim)
+        z_local_2 = self(local_views_2) # (batch_size, latent_dim)
+        z_local_mix = torch.cat([z_local_1, z_local_2], dim=1) # (batch_size, 2 * latent_dim)
+        ll_loss = torch.mean(self.regressor(z_local_mix), dim=0) # (1)
         gg_loss = self.info_nce_loss(z_global_1, z_global_2)
         gl_loss = (self.info_nce_loss(z_global_1, z_local_2) + self.info_nce_loss(z_global_2, z_local_1) + self.info_nce_loss(z_global_1, z_local_1) + self.info_nce_loss(z_global_2, z_local_2)) / 4
 
@@ -1048,11 +1081,14 @@ class GraphContrastiveModel(pl.LightningModule):
         recon = self.decoder(z_orig)
         recon = recon.reshape(-1)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
-        infor_loss = gg_loss + gl_loss
+        infor_loss = gg_loss + 0.8 * gl_loss + 0.4 * ll_loss
 
         # Total loss
         total_loss = infor_loss + self.hparams.recon_weight * recon_loss
 
+        graph_encoder_decoder_optimizer.zero_grad()
+        self.manual_backward(total_loss)
+        graph_encoder_decoder_optimizer.step()
         self.log_dict(
             {
                 "train_loss": total_loss,
@@ -1104,9 +1140,15 @@ class GraphContrastiveModel(pl.LightningModule):
         return total_loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(
-            self.parameters(), lr=self.hparams.lr, weight_decay=1e-5
+        regressor_optim = torch.optim.Adam(
+            self.regressor.parameters(), lr=self.hparams.lr, weight_decay=1e-5
         )
+        graph_encoder_decoder_optim = torch.optim.Adam(
+            list(self.conv1.parameters()) + list(self.conv2.parameters()) + list(self.project.parameters()) + list(self.decoder.parameters()),
+            lr=self.hparams.lr,
+            weight_decay=1e-5,
+        )
+        return [regressor_optim, graph_encoder_decoder_optim]
 
     def build_similarity_index(self, dataloader):
         """Build similarity index from a dataloader"""
