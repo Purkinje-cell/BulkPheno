@@ -1,4 +1,5 @@
 from matplotlib import pyplot as plt
+import os
 import pandas as pd
 import torch
 import numpy as np
@@ -6,7 +7,6 @@ import scanpy as sc
 import anndata as ad
 import pytorch_lightning as pl
 import seaborn as sns
-import os
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
 from sklearn.model_selection import train_test_split
@@ -238,8 +238,6 @@ class PhenotypeDataModule(pl.LightningDataModule):
         expressions = [item["expression"] for item in batch]
         labels = [item["label"] for item in batch]
         return (torch.stack(expressions), torch.stack(labels))
-
-
 class SpatialGraphDataset(Dataset):
     """
     Memory-efficient dataset for spatial transcriptomics data represented as graphs
@@ -277,6 +275,7 @@ class SpatialGraphDataset(Dataset):
         
         # Load or create the index of valid graphs
         self.valid_indices = self._load_or_create_index()
+        self.valid_indices = np.array(self.valid_indices) if not isinstance(self.valid_indices, np.ndarray) else self.valid_indices
 
     def _load_or_create_index(self):
         """Load existing index or create a new one if not found"""
@@ -287,6 +286,7 @@ class SpatialGraphDataset(Dataset):
         # Process and create index if not exists
         valid_indices = self._preprocess()
         torch.save(valid_indices, meta_path)
+        valid_indices = np.array(valid_indices)
         return valid_indices
 
     def _preprocess(self):
@@ -386,6 +386,7 @@ class SpatialGraphDataset(Dataset):
     def processed_file_names(self):
         """Return the index file name"""
         return [f"graph_index_{self.name}.pt"]
+
 
 
 
@@ -602,4 +603,3 @@ class GraphContrastiveDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             follow_batch=["x", "mean_expression"],
         )
-

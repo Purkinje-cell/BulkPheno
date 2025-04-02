@@ -5,12 +5,12 @@ from typing import Callable, Iterable, Literal, Union, List, Dict, Any
 
 
 import anndata as ad
+from pyro import sample
 import pytorch_lightning as pl
 import numpy as np
 import pandas as pd
 import scanpy as sc
 import scvi
-import squidpy as sq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,7 +22,6 @@ except ImportError:
     faiss = None
 from torch.utils.data import DataLoader, Dataset
 from anndata import AnnData
-from networkx import subgraph
 from scvi.nn import Decoder, DecoderSCVI, Embedding, Encoder, FCLayers
 from scvi.utils import setup_anndata_dsp
 from torch.distributions import Categorical, Distribution, Normal
@@ -41,7 +40,7 @@ from torch_geometric.nn import (
     ASAPooling,
     global_mean_pool,
 )
-from torch_geometric.utils import to_dense_adj, to_scipy_sparse_matrix, k_hop_subgraph
+from torch_geometric.utils import to_dense_adj, to_scipy_sparse_matrix, k_hop_subgraph, subgraph
 from torch_scatter import scatter_add
 
 # from module import BulkVAEModule
@@ -662,7 +661,13 @@ class BulkEncoderModel(pl.LightningModule):
 
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim, gcl_model.hparams.hidden_dim),
+            nn.BatchNorm1d(gcl_model.hparams.hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(gcl_model.hparams.hidden_dim, gcl_model.hparams.hidden_dim),
+            nn.BatchNorm1d(gcl_model.hparams.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(gcl_model.hparams.hidden_dim, input_dim),
         )
         
@@ -785,6 +790,27 @@ class BulkEncoderModel(pl.LightningModule):
 
         return torch.cat(embeddings, dim=0).numpy()
 
+class InfoNCELoss(nn.Module):
+    """InfoNCE loss for contrastive learning"""
+
+    def __init__(self, temperature: float = 0.5):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, z_i, z_j):
+        # Normalize embeddings
+        z_i = F.normalize(z_i, dim=1)
+        z_j = F.normalize(z_j, dim=1)
+
+        # Dot product similarity
+        sim = torch.einsum("nc,nc->n", z_i, z_j) / self.temperature
+
+        # Loss calculation
+        loss = -torch.log(
+            torch.exp(sim) / (torch.exp(sim).sum() + 1e-6)
+        ).mean()  # Numerically stable
+
+        return loss
 
 class GraphContrastiveModel(pl.LightningModule):
     """Contrastive learning model for spatial transcriptomics graphs"""
@@ -821,7 +847,7 @@ class GraphContrastiveModel(pl.LightningModule):
             )
             self.conv2 = GINConv(
                 nn.Sequential(
-                    nn.Linear(input_dim, hidden_dim),
+                    nn.Linear(hidden_dim, hidden_dim),
                     nn.ReLU(),
                     nn.Linear(hidden_dim, hidden_dim),
                 )
@@ -834,30 +860,41 @@ class GraphContrastiveModel(pl.LightningModule):
                 hidden_dim, hidden_dim, aggregators=["mean", "min", "max", "std"]
             )
 
-        self.project = nn.Linear(hidden_dim, latent_dim)
+        self.project = nn.Sequential(
+            nn.Linear(hidden_dim, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
         # Reconstruction decoder
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(hidden_dim, input_dim),
         )
-
         # Triplet loss with hard mining
         self.triplet_loss = TripletGCLLoss(margin=margin)
 
         # Embedding store for similarity search
         self.embedding_store = EmbeddingStore(metric="cosine")
+        self.info_nce_loss = InfoNCELoss(temperature=0.5)
 
     def encode(self, x, edge_index, edge_attr, batch=None):
         """Encode graph data to latent space"""
         # First graph convolution
         if self.conv_layer in ['GCN', 'GIN']:
             x = self.conv1(x, edge_index).relu()
-        x = self.conv1(x, edge_index, edge_attr=edge_attr).relu()
+            x = self.conv2(x, edge_index).relu()
+        else: 
+            x = self.conv1(x, edge_index, edge_attr=edge_attr).relu()
+            # Second graph convolution
+            x = self.conv2(x, edge_index, edge_attr=edge_attr).relu()
 
-        # Second graph convolution
-        x = self.conv2(x, edge_index, edge_attr=edge_attr)
-        x = F.relu(x)
         x = self.project(x)
 
         # If batch indices provided, pool to graph-level embeddings
@@ -887,8 +924,8 @@ class GraphContrastiveModel(pl.LightningModule):
         g.x = g.x[perm]
 
         # # Feature dropout
-        # drop_mask = torch.rand_like(g.x) < self.hparams.feature_drop_rate
-        # g.x[drop_mask] = 0
+        drop_mask = torch.rand_like(g.x) < self.hparams.feature_drop_rate
+        g.x[drop_mask] = 0
 
         # # Edge dropping
         # if g.edge_index.size(1) > 0:
@@ -945,41 +982,82 @@ class GraphContrastiveModel(pl.LightningModule):
             embeddings[indices[:, 2]],
         )
 
-    def training_step(self, batch, batch_idx):
+    def sample_graphs(self, data:Data, ratio:float=0.8):
+        """Sample a batch of graphs for triplet mining"""
+        sample_indices = torch.randperm(data.num_nodes)
+        split_idx = int(ratio * len(sample_indices))
+        sample_indices = sample_indices[:split_idx]
+        
+        edge_index, edge_attr = subgraph(sample_indices, data.edge_index, data.edge_attr, relabel_nodes=True)
+        x = data.x[sample_indices]
+        batch = data.batch[sample_indices] if data.batch is not None else None
+        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, batch=batch)
+        
+
+    def training_step(self, batch: Batch, batch_idx):
         # Generate augmented view
-        augmented_batch = self._augment_batch(batch)
+        # augmented_batch = self._augment_batch(batch)
+        
+        data_list = batch.to_data_list()
+        global_views_1 = []
+        global_views_2 = []
+        local_views_1 = []
+        local_views_2 = []
+        for data in data_list:
+            global_view_1 = self.sample_graphs(data)
+            global_view_2 = self.sample_graphs(data)
+            local_view_1 = self.sample_graphs(data, ratio=0.2)
+            local_view_2 = self.sample_graphs(data, ratio=0.2)
+            global_views_1.append(global_view_1)
+            global_views_2.append(global_view_2)
+            local_views_1.append(local_view_1)
+            local_views_2.append(local_view_2)
+        
+        global_views_1 = Batch.from_data_list(global_views_1)
+        global_views_2 = Batch.from_data_list(global_views_2)
+        local_views_1 = Batch.from_data_list(local_views_1)
+        local_views_2 = Batch.from_data_list(local_views_2)
+        z_global_1 = self(global_views_1)
+        z_global_2 = self(global_views_2)
+        z_local_1 = self(local_views_1)
+        z_local_2 = self(local_views_2)
 
         # Get embeddings for both original and augmented
         z_orig = self(batch)
-        z_aug = self(augmented_batch)
+        # z_aug = self(augmented_batch)
 
         # Combine embeddings and center nodes
-        combined_z = torch.cat([z_orig, z_aug], dim=0)
-        combined_centers = torch.cat(
-            [batch.center_node_idx, batch.center_node_idx], dim=0
-        )
+        # combined_z = torch.cat([z_orig, z_aug], dim=0)
+        # combined_centers = torch.cat(
+        #     [batch.center_node_idx, batch.center_node_idx], dim=0
+        # )
+
+        gg_loss = self.info_nce_loss(z_global_1, z_global_2)
+        gl_loss = (self.info_nce_loss(z_global_1, z_local_2) + self.info_nce_loss(z_global_2, z_local_1) + self.info_nce_loss(z_global_1, z_local_1) + self.info_nce_loss(z_global_2, z_local_2)) / 4
 
         # Mine hard triplets
-        triplets = self._get_hard_triplets(combined_z, combined_centers)
+        # triplets = self._get_hard_triplets(combined_z, combined_centers)
 
         # Calculate triplet loss
-        if triplets is None:
-            cl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        else:
-            cl_loss = self.triplet_loss(*triplets)
+        # if triplets is None:
+        #     cl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        # else:
+        #     cl_loss = self.triplet_loss(*triplets)
 
         # Reconstruction loss
         recon = self.decoder(z_orig)
         recon = recon.reshape(-1)
         recon_loss = F.mse_loss(recon, batch.mean_expression)
+        infor_loss = gg_loss + gl_loss
 
         # Total loss
-        total_loss = cl_loss + self.hparams.recon_weight * recon_loss
+        total_loss = infor_loss + self.hparams.recon_weight * recon_loss
 
         self.log_dict(
             {
                 "train_loss": total_loss,
-                "triplet_loss": cl_loss,
+                "info_loss": infor_loss,
+                # "triplet_loss": cl_loss,
                 "recon_loss": recon_loss,
             }
         )
