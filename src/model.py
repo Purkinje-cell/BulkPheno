@@ -1,20 +1,17 @@
 import collections
-from re import sub
-import re
 from typing import Callable, Iterable, Literal, Union, List, Dict, Any
 
 
 import anndata as ad
-from pyro import sample
 import pytorch_lightning as pl
 import numpy as np
 import pandas as pd
 import scanpy as sc
-import scvi
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.neighbors import NearestNeighbors
+from tqdm import tqdm
 
 try:
     import faiss
@@ -40,7 +37,7 @@ from torch_geometric.nn import (
     ASAPooling,
     global_mean_pool,
 )
-from torch_geometric.utils import to_dense_adj, to_scipy_sparse_matrix, k_hop_subgraph, subgraph
+from torch_geometric.utils import to_dense_adj, to_scipy_sparse_matrix, k_hop_subgraph, subgraph, from_scipy_sparse_matrix, remove_self_loops
 from torch_scatter import scatter_add
 
 # from module import BulkVAEModule
@@ -1149,6 +1146,55 @@ class GraphContrastiveModel(pl.LightningModule):
             weight_decay=1e-5,
         )
         return [regressor_optim, graph_encoder_decoder_optim]
+    
+    def get_graph_embedding(self, adata: ad.AnnData, hops):
+        """Get graph embeddings for bulk RNA data"""
+        self.eval()
+
+        edge_index, edge_attr = from_scipy_sparse_matrix(
+            adata.obsp["distances"]
+        )
+        mask = edge_attr < 50
+        edge_index = edge_index[:, mask]
+        edge_attr = edge_attr[mask]
+        edge_index, edge_attr = remove_self_loops(edge_index, edge_attr)
+        embeddings = []
+        valid_idx = []
+        with torch.no_grad():
+            for node_idx in tqdm(range(adata.shape[0]), desc = "Processing nodes"):
+                subset, edge_index_sub, _, edge_mask = k_hop_subgraph(
+                    node_idx,
+                    hops,
+                    edge_index,
+                    num_nodes=adata.shape[0],
+                    relabel_nodes=True,
+                )
+                
+                # Skip nodes with no neighbors
+                if subset.shape[0] <= 1:
+                    print(f'Node {node_idx} has no neighbors')
+                    embeddings.append(torch.zeros(1, self.hparams.latent_dim))
+                    
+                if hasattr(adata.X, "toarray"):
+                    features = torch.tensor(
+                        adata.X[subset].toarray(), dtype=torch.float
+                    )
+                else:
+                    features = torch.tensor(adata.X[subset], dtype=torch.float)
+                
+                # Ensure features are on the same device as the model
+                features = features.to(self.device)
+                edge_index_sub = edge_index_sub.to(self.device)
+                edge_attr_sub = edge_attr[edge_mask].to(self.device)
+                
+                # Get graph embedding
+                z = self.encode(features, edge_index_sub, edge_attr_sub)
+                z = torch.mean(z, dim=0, keepdim=True)  # (1, latent_dim)
+                embeddings.append(z.cpu())
+                valid_idx.append(node_idx)
+        embeddings = torch.concat(embeddings, dim=0) # (num_nodes, latent_dim)
+        print(f"Graph embeddings shape: {embeddings.shape}")
+        return embeddings, valid_idx # 
 
     def build_similarity_index(self, dataloader):
         """Build similarity index from a dataloader"""

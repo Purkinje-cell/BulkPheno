@@ -1,3 +1,4 @@
+from re import T
 from matplotlib import pyplot as plt
 import os
 import pandas as pd
@@ -251,6 +252,7 @@ class SpatialGraphDataset(Dataset):
         batch_key=None, 
         hops=2, 
         root="../data",
+        downsample_num=None,
         transform=None):
         """
         Args:
@@ -269,6 +271,7 @@ class SpatialGraphDataset(Dataset):
         self.transform = transform
         self.processed_dir = os.path.join(root, "processed")
         self.graph_dir = os.path.join(self.processed_dir, f"graphs_{name}")
+        self.downsample_num = downsample_num
         
         os.makedirs(self.processed_dir, exist_ok=True)
         os.makedirs(self.graph_dir, exist_ok=True)
@@ -288,6 +291,66 @@ class SpatialGraphDataset(Dataset):
         torch.save(valid_indices, meta_path)
         valid_indices = np.array(valid_indices)
         return valid_indices
+    
+    def process_graph(self, node_idx, edge_index, edge_attr):
+        
+        graph_path = os.path.join(self.graph_dir, f"graph_{node_idx}.pt")
+        # Extract k-hop subgraph with edge attributes
+        subset, edge_index_sub, _, edge_mask = k_hop_subgraph(
+            node_idx,
+            self.hops,
+            edge_index,
+            num_nodes=self.adata.shape[0],
+            relabel_nodes=True,
+        )
+        
+        # Skip nodes with no neighbors
+        if subset.shape[0] <= 1:
+            print(f'Node {node_idx} has no neighbors')
+            return False
+            
+        # Get spatial coordinates and features
+        spatial_coords = torch.tensor(
+            self.adata.obsm["spatial"][subset], dtype=torch.float
+        )
+        
+        if hasattr(self.adata.X, "toarray"):
+            features = torch.tensor(
+                self.adata.X[subset].toarray(), dtype=torch.float
+            )
+        else:
+            features = torch.tensor(self.adata.X[subset], dtype=torch.float)
+
+        # Calculate reconstruction target
+        mean_expression = features.mean(dim=0)
+        edge_attr_sub = edge_attr[edge_mask]
+        
+        # Create graph data object
+        if self.batch_key:
+            batch = torch.tensor(self.adata.obs[self.batch_key][node_idx]).reshape(-1)
+            graph = Data(
+                x=features,
+                edge_index=edge_index_sub,
+                edge_attr=edge_attr_sub,
+                pos=spatial_coords,
+                center_node_idx=node_idx,
+                mean_expression=mean_expression,
+                batch=batch,
+            )
+        else:
+            graph = Data(
+                x=features,
+                edge_index=edge_index_sub,
+                edge_attr=edge_attr_sub,
+                pos=spatial_coords,
+                center_node_idx=node_idx,
+                mean_expression=mean_expression,
+                batch=torch.zeros(1, dtype=torch.long)
+            )
+            
+        # Save individual graph to disk with compression
+        torch.save(graph, graph_path, _use_new_zipfile_serialization=True)
+        return True
 
     def _preprocess(self):
         """Process and save individual graphs to disk"""
@@ -305,70 +368,25 @@ class SpatialGraphDataset(Dataset):
         # Visualize edge length distribution
         sns.displot(edge_attr, bins=100)
         plt.savefig(f'../figures/{self.name}_edge_length.png')
+
+        remained_nodes = np.arange(self.adata.shape[0])
+        if self.downsample_num is not None:
+            remained_nodes = np.random.choice(
+                remained_nodes, size=self.downsample_num, replace=False
+            )
+        remained_nodes = remained_nodes.tolist()
         
-        for node_idx in tqdm(range(self.adata.shape[0])):
+        for node_idx in tqdm(remained_nodes, desc="Processing graphs"):
             # Skip if already processed
             graph_path = os.path.join(self.graph_dir, f"graph_{node_idx}.pt")
             if os.path.exists(graph_path):
                 valid_indices.append(node_idx)
                 continue
-                
-            # Extract k-hop subgraph with edge attributes
-            subset, edge_index_sub, _, edge_mask = k_hop_subgraph(
-                node_idx,
-                self.hops,
-                edge_index,
-                num_nodes=self.adata.shape[0],
-                relabel_nodes=True,
-            )
-            
-            # Skip nodes with no neighbors
-            if subset.shape[0] <= 1:
-                print(f'Node {node_idx} has no neighbors')
-                continue
-                
-            # Get spatial coordinates and features
-            spatial_coords = torch.tensor(
-                self.adata.obsm["spatial"][subset], dtype=torch.float
-            )
-            
-            if hasattr(self.adata.X, "toarray"):
-                features = torch.tensor(
-                    self.adata.X[subset].toarray(), dtype=torch.float
-                )
+            # Process and save graph
+            if self.process_graph(node_idx, edge_index, edge_attr):
+                valid_indices.append(node_idx)
             else:
-                features = torch.tensor(self.adata.X[subset], dtype=torch.float)
-
-            # Calculate reconstruction target
-            mean_expression = features.mean(dim=0)
-            edge_attr_sub = edge_attr[edge_mask]
-            
-            # Create graph data object
-            if self.batch_key:
-                batch = torch.tensor(self.adata.obs[self.batch_key][node_idx]).reshape(-1)
-                graph = Data(
-                    x=features,
-                    edge_index=edge_index_sub,
-                    edge_attr=edge_attr_sub,
-                    pos=spatial_coords,
-                    center_node_idx=node_idx,
-                    mean_expression=mean_expression,
-                    batch=batch,
-                )
-            else:
-                graph = Data(
-                    x=features,
-                    edge_index=edge_index_sub,
-                    edge_attr=edge_attr_sub,
-                    pos=spatial_coords,
-                    center_node_idx=node_idx,
-                    mean_expression=mean_expression,
-                    batch=torch.zeros(1, dtype=torch.long)
-                )
-                
-            # Save individual graph to disk with compression
-            torch.save(graph, graph_path, _use_new_zipfile_serialization=True)
-            valid_indices.append(node_idx)
+                print(f"Node {node_idx} has no neighbors")
 
         return valid_indices
 
